@@ -117,6 +117,13 @@ async function signedFetch(credentials, request) {
   const amzDate = awsTimestamp(now);
   const dateStamp = amzDate.slice(0, 8);
   const canonicalUri = objectUri(credentials.bucket, request.objectKey);
+  const canonicalQuery = request.query
+    ? Object.entries(request.query)
+        .map(([key, value]) => [awsEncode(key), awsEncode(value)])
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, value]) => `${key}=${value}`)
+        .join("&")
+    : "";
   const headers = {
     ...lowercaseHeaders(request.headers ?? {}),
     host: credentials.endpoint.host,
@@ -125,12 +132,12 @@ async function signedFetch(credentials, request) {
   };
   const signedHeaderNames = Object.keys(headers).filter((name) => name !== "content-length").sort();
   const canonicalHeaders = signedHeaderNames.map((name) => `${name}:${normalizeHeader(headers[name])}\n`).join("");
-  const canonicalRequest = [request.method, canonicalUri, "", canonicalHeaders, signedHeaderNames.join(";"), request.payloadHash].join("\n");
+  const canonicalRequest = [request.method, canonicalUri, canonicalQuery, canonicalHeaders, signedHeaderNames.join(";"), request.payloadHash].join("\n");
   const scope = `${dateStamp}/auto/s3/aws4_request`;
   const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Text(canonicalRequest)].join("\n");
   const signature = signString(credentials.secretAccessKey, dateStamp, stringToSign);
   const authorization = `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${scope}, SignedHeaders=${signedHeaderNames.join(";")}, Signature=${signature}`;
-  const url = new URL(canonicalUri, credentials.endpoint);
+  const url = new URL(canonicalUri + (canonicalQuery ? `?${canonicalQuery}` : ""), credentials.endpoint);
   return fetch(url, {
     method: request.method,
     headers: { ...headers, authorization },
@@ -138,6 +145,20 @@ async function signedFetch(credentials, request) {
     duplex: request.body && typeof request.body.pipe === "function" ? "half" : undefined,
     signal: AbortSignal.timeout(180000)
   });
+}
+
+export async function listObjects(credentials, prefix, maxKeys = 100) {
+  const response = await signedFetchWithRetry(credentials, {
+    method: "GET",
+    objectKey: "",
+    payloadHash: EMPTY_SHA256,
+    query: { "list-type": "2", prefix, "max-keys": String(maxKeys) }
+  });
+  if (!response.ok) fail(`R2 LIST returned HTTP ${response.status}`);
+  const xml = await response.text();
+  const keys = [];
+  for (const match of xml.matchAll(/<Key>([^<]+)<\/Key>/g)) keys.push(match[1]);
+  return keys;
 }
 
 async function signedFetchWithRetry(credentials, request) {
