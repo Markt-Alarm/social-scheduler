@@ -46,15 +46,18 @@ async function writeRunLog(credentials, summary) {
 async function publishItem(credentials, queue, item) {
   const token = tokenFor(item.brand);
   item.platformStates = item.platformStates ?? {};
+  const isCarousel = item.kind === "carousel";
+  const mediaUrl = isCarousel ? undefined : presignGet(credentials, item.media.objectKey, 3600);
+  const mediaUrls = isCarousel ? item.media.slides.map((slide) => presignGet(credentials, slide.objectKey, 3600)) : [];
   for (const platform of item.platforms) {
     const initialState = item.platformStates[platform] ?? { status: "PENDING" };
-    const mediaUrl = presignGet(credentials, item.media.objectKey, 3600);
     await publishPlatform({
       config: graphConfig(),
-      socialPackage: { kind: item.kind, caption: item.caption, media: item.media, options: item.options ?? { instagram: { shareToFeed: true }, facebook: { title: "" } } },
+      socialPackage: { kind: item.kind, caption: item.caption, media: { path: isCarousel ? undefined : item.media.path }, options: item.options ?? { instagram: { shareToFeed: true }, facebook: { title: "" } } },
       account: item.account,
       token,
       mediaUrl,
+      mediaUrls,
       platform,
       platformState: initialState,
       checkpoint: async (state) => {
@@ -136,7 +139,8 @@ async function check() {
   const mediaProbe = queueText === null ? [] : JSON.parse(queueText).items.filter((item) => item.status === "SCHEDULED").slice(0, 2);
   report.mediaProbe = [];
   for (const item of mediaProbe) {
-    const head = await headObject(credentials, item.media.objectKey);
+    const probeKey = item.media.objectKey ?? item.media.slides?.[0]?.objectKey;
+    const head = await headObject(credentials, probeKey);
     report.mediaProbe.push({ fingerprint: item.fingerprint.slice(0, 8), vorhanden: head.exists, bytes: head.bytes ?? 0 });
   }
   report.tokens = {};

@@ -666,23 +666,141 @@ async function publishFacebookReel(context, socialPackage, account, mediaUrl, in
   return state;
 }
 
-export async function publishPlatform({ config, socialPackage, account, token, mediaUrl, platform, platformState = {}, checkpoint = async () => {} }) {
+async function publishInstagramCarousel(context, socialPackage, account, mediaUrls, initialState, checkpoint) {
+  let state = { ...initialState };
+  const save = async (patch) => {
+    state = { ...state, ...patch, updatedAt: new Date().toISOString() };
+    await checkpoint(state);
+  };
+  if (state.publishPhase === "REQUESTING") {
+    await reconcileInstagramAmbiguity(context, state, save);
+    if (state.status === "PUBLISHED") return state;
+  }
+  const children = Array.isArray(state.children) ? [...state.children] : [];
+  for (let index = 0; index < mediaUrls.length; index += 1) {
+    if (children[index]) continue;
+    const response = await safeGraphRequest(context, {
+      method: "POST",
+      url: context.graphUrl(account.instagramAccountId, "media"),
+      form: { image_url: mediaUrls[index], is_carousel_item: "true" },
+      label: `Instagram carousel item ${index + 1} creation`
+    });
+    if (!response.id) throw new QaBlockedError("Instagram carousel item creation returned no id.", { item: index + 1 });
+    children[index] = String(response.id);
+    await save({ status: "CHILDREN_UPLOAD", children: [...children] });
+  }
+  for (let index = 0; index < children.length; index += 1) {
+    const childStatus = await pollInstagramContainer(context, children[index]);
+    if (["PUBLISHED", "FINISHED"].includes(childStatus.statusCode)) continue;
+    throw new QaBlockedError("Instagram carousel item did not become publishable.", { containerId: children[index], statusCode: childStatus.statusCode });
+  }
+  if (!state.containerId) {
+    const response = await safeGraphRequest(context, {
+      method: "POST",
+      url: context.graphUrl(account.instagramAccountId, "media"),
+      form: { media_type: "CAROUSEL", children: children.join(","), caption: socialPackage.caption },
+      label: "Instagram carousel container creation"
+    });
+    if (!response.id) throw new QaBlockedError("Instagram carousel container creation returned no id.");
+    await save({ status: "CONTAINER_CREATED", containerId: String(response.id), containerCreatedAt: new Date().toISOString() });
+  }
+  const containerStatus = await pollInstagramContainer(context, state.containerId);
+  await save({ lastContainerStatus: containerStatus.statusCode, lastContainerStatusAt: new Date().toISOString() });
+  if (containerStatus.statusCode === "PUBLISHED") {
+    await save({ status: "PUBLISHED", publishedAt: new Date().toISOString(), recoveredFromContainerStatus: true });
+    return state;
+  }
+  if (containerStatus.statusCode !== "FINISHED") {
+    throw new QaBlockedError("Instagram carousel container did not become publishable.", { containerId: state.containerId, statusCode: containerStatus.statusCode });
+  }
+  await save({ status: "SUBMITTING", publishPhase: "REQUESTING", publishRequestedAt: new Date().toISOString() });
+  let response;
+  try {
+    response = await publishMutationOnce(context, {
+      method: "POST",
+      url: context.graphUrl(account.instagramAccountId, "media_publish"),
+      form: { creation_id: state.containerId },
+      label: "Instagram carousel publish"
+    });
+  } catch (error) {
+    if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
+    throw error;
+  }
+  if (!response.id) throw new QaBlockedError("Instagram carousel publish returned no media id.");
+  await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.id), publishedAt: new Date().toISOString() });
+  return state;
+}
+
+async function publishFacebookCarousel(context, socialPackage, account, mediaUrls, initialState, checkpoint) {
+  let state = { ...initialState };
+  const save = async (patch) => {
+    state = { ...state, ...patch, updatedAt: new Date().toISOString() };
+    await checkpoint(state);
+  };
+  // Unveroeffentlichte Fotos sind unsichtbar; ein Retry kann hoechstens ein
+  // verwaistes Foto erzeugen, daher safeGraphRequest statt Mutation-Schutz.
+  const photoIds = Array.isArray(state.photoIds) ? [...state.photoIds] : [];
+  for (let index = 0; index < mediaUrls.length; index += 1) {
+    if (photoIds[index]) continue;
+    const response = await safeGraphRequest(context, {
+      method: "POST",
+      url: context.graphUrl(account.pageId, "photos"),
+      form: { url: mediaUrls[index], published: "false" },
+      label: `Facebook carousel photo ${index + 1} staging`
+    });
+    if (!response.id) throw new QaBlockedError("Facebook carousel photo staging returned no id.", { item: index + 1 });
+    photoIds[index] = String(response.id);
+    await save({ status: "PHOTOS_STAGED", photoIds: [...photoIds] });
+  }
+  if (state.publishPhase !== "CONFIRMED") {
+    blockUnresolvedRequest(state, "Facebook carousel");
+    await save({ status: "SUBMITTING", publishPhase: "REQUESTING", publishRequestedAt: new Date().toISOString() });
+    const form = { message: socialPackage.caption };
+    photoIds.forEach((photoId, index) => {
+      form[`attached_media[${index}]`] = JSON.stringify({ media_fbid: photoId });
+    });
+    let response;
+    try {
+      response = await publishMutationOnce(context, {
+        method: "POST",
+        url: context.graphUrl(account.pageId, "feed"),
+        form,
+        label: "Facebook carousel feed publish"
+      });
+    } catch (error) {
+      if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
+      throw error;
+    }
+    if (!response.id && !response.post_id) throw new QaBlockedError("Facebook carousel feed publish returned no object id.");
+    await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.post_id ?? response.id), publishedAt: new Date().toISOString() });
+  }
+  return state;
+}
+
+export async function publishPlatform({ config, socialPackage, account, token, mediaUrl, mediaUrls = [], platform, platformState = {}, checkpoint = async () => {} }) {
   if (platformState.status === "PUBLISHED") return platformState;
   if (platformState.status === "AMBIGUOUS") {
     throw new AmbiguousMutationError(`Existing ambiguous ${platform} state requires operator reconciliation.`, { platform });
   }
+  const urls = mediaUrls.length ? mediaUrls : [mediaUrl];
   const context = makeContext(config, token);
+  if (platform === "instagram" && socialPackage.kind === "carousel") {
+    return publishInstagramCarousel(context, socialPackage, account, urls, platformState, checkpoint);
+  }
   if (platform === "instagram") {
-    return publishInstagram(context, socialPackage, account, mediaUrl, platformState, checkpoint);
+    return publishInstagram(context, socialPackage, account, urls[0], platformState, checkpoint);
+  }
+  if (platform === "facebook" && socialPackage.kind === "carousel") {
+    return publishFacebookCarousel(context, socialPackage, account, urls, platformState, checkpoint);
   }
   if (platform === "facebook" && socialPackage.kind === "post") {
-    return publishFacebookPhoto(context, socialPackage, account, mediaUrl, platformState, checkpoint);
+    return publishFacebookPhoto(context, socialPackage, account, urls[0], platformState, checkpoint);
   }
   if (platform === "facebook" && socialPackage.kind === "video") {
-    return publishFacebookVideo(context, socialPackage, account, mediaUrl, platformState, checkpoint);
+    return publishFacebookVideo(context, socialPackage, account, urls[0], platformState, checkpoint);
   }
   if (platform === "facebook" && socialPackage.kind === "reel") {
-    return publishFacebookReel(context, socialPackage, account, mediaUrl, platformState, checkpoint);
+    return publishFacebookReel(context, socialPackage, account, urls[0], platformState, checkpoint);
   }
   throw new QaBlockedError("Unsupported platform/kind publishing route.", { platform, kind: socialPackage.kind });
 }
