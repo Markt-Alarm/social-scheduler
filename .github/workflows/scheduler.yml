@@ -2,8 +2,8 @@ name: publish-due
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # alle 5 Minuten: faellige Posts veroeffentlichen
-    - cron: "7 3 * * *"     # taeglich: Keepalive-Commit (GitHub deaktiviert Cron-Workflows nach 60 Tagen Inaktivitaet)
+    - cron: "3-58/5 * * * *"   # alle 5 Minuten, versetzt (volle Slots sind am staerksten ausgelastet)
+    - cron: "7 3 * * *"        # taeglich: Keepalive-Commit (GitHub deaktiviert Cron-Workflows nach 60 Tagen Inaktivitaet)
   workflow_dispatch:
     inputs:
       mode:
