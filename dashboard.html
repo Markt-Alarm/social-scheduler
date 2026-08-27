@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload-Planer</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --panel2:#1d242e; --line:#2a3341; --text:#e8ecf2; --muted:#8b97a8;
+    --ws:#e0453a; --ws2:#f0b429; --mzm:#5d9b6c; --ok:#3fae6a; --warn:#e0a53a; --err:#e0453a; --amb:#9b6ce0; --run:#e0b23a;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.3px}
+  h1 span{color:var(--muted);font-weight:400}
+  .seg{display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .seg button{background:none;border:0;color:var(--muted);padding:6px 14px;cursor:pointer;font:inherit}
+  .seg button.active{background:#2c3644;color:var(--text)}
+  .chip{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:999px;padding:5px 12px;cursor:pointer;font:inherit;display:inline-flex;align-items:center;gap:7px}
+  .chip .dot{width:9px;height:9px;border-radius:50%}
+  .chip.active{color:var(--text);border-color:#3d4a5c}
+  .nav{display:flex;align-items:center;gap:6px}
+  .nav b{min-width:190px;text-align:center;font-size:15px}
+  .nav button,.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:5px 11px;cursor:pointer;font:inherit}
+  .ghost:hover,.nav button:hover{background:#252e3a}
+  .spacer{flex:1}
+  .live{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:7px}
+  .live .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite}
+  .live.paused .pulse{background:var(--warn);animation:none}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  #stats{display:flex;gap:14px;font-size:12px;color:var(--muted)}
+  #stats b{color:var(--text)}
+  main{flex:1;overflow:auto;padding:14px}
+  /* Monat */
+  #month{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;grid-auto-rows:minmax(118px,1fr);height:100%}
+  .dow{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;text-align:center;grid-row:1}
+  .cell{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px;overflow:hidden;display:flex;flex-direction:column;gap:4px;min-height:0}
+  .cell.today{border-color:#4a6b8a;box-shadow:inset 0 0 0 1px #4a6b8a}
+  .cell.out{opacity:.38}
+  .cell .d{font-size:12px;color:var(--muted)}
+  .cell.today .d{color:var(--text);font-weight:700}
+  .mini{display:flex;align-items:center;gap:6px;background:var(--panel2);border-radius:7px;padding:3px 6px;font-size:11px;cursor:pointer;border-left:3px solid var(--muted);white-space:nowrap;overflow:hidden}
+  .mini:hover{background:#273140}
+  .mini .t{color:var(--muted);font-variant-numeric:tabular-nums}
+  .mini .k{overflow:hidden;text-overflow:ellipsis}
+  .more{font-size:11px;color:var(--muted);padding-left:4px}
+  /* Woche */
+  #week{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;height:100%}
+  .col{background:var(--panel);border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column;min-height:0}
+  .col .hd{padding:8px 10px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+  .col.today .hd{color:var(--text);font-weight:700}
+  .col .bd{padding:8px;display:flex;flex-direction:column;gap:7px;overflow:auto}
+  /* Tag */
+  #day{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+  /* Karten */
+  .card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--muted);border-radius:11px;padding:10px 12px;cursor:pointer;display:flex;gap:12px;align-items:flex-start}
+  .card:hover{background:#1a212b;border-color:#39465a}
+  .card .time{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;min-width:40px;padding-top:2px}
+  .card .thumb{width:74px;height:74px;border-radius:8px;object-fit:cover;background:#0a0d11;flex:none}
+  .card .body{min-width:0;flex:1}
+  .card .title{font-weight:600;margin-bottom:2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .card .cap{color:var(--muted);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .badge{font-size:10px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .badge.WS{border-color:#5c3531;color:#f0a29b}
+  .badge.MZM{border-color:#33513c;color:#9fd0ab}
+  .badge.published{border-color:#2f5e42;color:#8fd7a8}
+  .badge.failed{border-color:#5c3531;color:#f0a29b}
+  .badge.publishing,.badge.submitted{border-color:#6b5620;color:#ecd28a}
+  .badge.ambiguous{border-color:#4a3570;color:#c7aef0}
+  .kind{color:var(--muted);font-size:11px}
+  .WS{border-left-color:var(--ws)}
+  .MZM{border-left-color:var(--mzm)}
+  .empty{color:var(--muted);text-align:center;padding:40px 0}
+  /* Modal */
+  #modal{position:fixed;inset:0;background:rgba(5,8,12,.72);display:none;align-items:center;justify-content:center;z-index:50}
+  #modal.open{display:flex}
+  #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;max-width:760px;width:94%;max-height:92vh;overflow:auto;padding:18px}
+  #modal .media{width:100%;max-height:52vh;object-fit:contain;border-radius:10px;background:#0a0d11;display:block;margin-bottom:12px}
+  #modal .slides{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  #modal .slides img{width:74px;height:74px;object-fit:cover;border-radius:8px;cursor:pointer;border:2px solid transparent}
+  #modal .slides img.sel{border-color:var(--ws2)}
+  #modal h2{margin:0 0 6px;font-size:16px}
+  #modal .meta{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12px;color:var(--muted);margin:10px 0}
+  #modal .meta b{color:var(--text);font-weight:600}
+  #modal .cap{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12.5px;max-height:24vh;overflow:auto}
+  #modal .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#2c3644;border-radius:5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Upload-Planer <span>· Cloud-Queue</span></h1>
+  <div class="seg" id="views">
+    <button data-v="day">Tag</button><button data-v="week" class="active">Woche</button><button data-v="month">Monat</button>
+  </div>
+  <div class="nav">
+    <button id="prev">‹</button><b id="label"></b><button id="next">›</button><button id="today">Heute</button>
+  </div>
+  <span class="chip active" data-b="all">Alle</span>
+  <span class="chip" data-b="werkstern"><span class="dot" style="background:var(--ws)"></span>Werkstern</span>
+  <span class="chip" data-b="massage-zuhause"><span class="dot" style="background:var(--mzm)"></span>Massage-Zuhause</span>
+  <span class="spacer"></span>
+  <div id="stats"></div>
+  <div class="live" id="live"><span class="pulse"></span><span id="liveTxt">verbinde…</span></div>
+  <button class="ghost" id="pause">Pause</button>
+  <button class="ghost" id="fs">Vollbild</button>
+</header>
+<main id="main"></main>
+<div id="modal"><div class="box" id="mbox"></div></div>
+<script>
+"use strict";
+const KIND = {story:"Story",reel:"Reel",carousel:"Carousel",post:"Beitrag",video:"Video"};
+const STATUS = {SCHEDULED:["Geplant",""],PUBLISHING:["Wird veröffentlicht","publishing"],SUBMITTING:["Wird veröffentlicht","publishing"],PUBLISHED:["Veröffentlicht","published"],FAILED:["Fehler","failed"],AMBIGUOUS:["Prüfen","ambiguous"],CONTAINER_CREATED:["In Vorbereitung","publishing"],CHILDREN_UPLOAD:["In Vorbereitung","publishing"],UPLOAD_SESSION:["In Vorbereitung","publishing"],UPLOADED:["In Vorbereitung","publishing"],SUBMITTED:["Wird veröffentlicht","publishing"],PHOTOS_STAGED:["In Vorbereitung","publishing"]};
+const DOW = ["Mo","Di","Mi","Do","Fr","Sa","So"];
+const MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
+let items = [], view = "week", cursor = new Date(), brand = "all", paused = false, timer = null, sel = null, slide = 0;
+
+const $ = (sel2) => document.querySelector(sel2);
+const pad = (n) => String(n).padStart(2,"0");
+const isoDay = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const dayOf = (item) => (item.scheduledLocal || item.scheduledAt).slice(0,10);
+const timeOf = (item) => (item.scheduledLocal || item.scheduledAt).slice(11,16);
+const shortCap = (c) => (c||"").replace(/\s+/g," ").trim().slice(0,90);
+const statusOf = (item) => {
+  const states = Object.values(item.platformStates || {}).map(s => s.status);
+  if (states.includes("AMBIGUOUS")) return ["Prüfen","ambiguous"];
+  if (states.includes("PUBLISHED")) return ["Veröffentlicht","published"];
+  if (item.status === "PUBLISHED") return ["Veröffentlicht","published"];
+  if (item.status === "FAILED") return ["Fehler","failed"];
+  if (item.status === "AMBIGUOUS") return ["Prüfen","ambiguous"];
+  if (item.status === "PUBLISHING" || states.some(s => s && s !== "PENDING")) return ["In Arbeit","publishing"];
+  return STATUS[item.status] || [item.status,""];
+};
+function statusBadge(item){
+  const [label, cls] = statusOf(item);
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+async function refresh(){
+  try{
+    const res = await fetch("/api/queue");
+    if(!res.ok) throw new Error(res.status);
+    items = (await res.json()).items || [];
+    $("#liveTxt").textContent = "live · " + new Date().toLocaleTimeString("de-DE");
+    $("#live").classList.remove("paused");
+    render();
+  }catch(e){
+    $("#liveTxt").textContent = "offline — Verbindung?";
+    $("#live").classList.add("paused");
+  }
+}
+function startPoll(){ clearInterval(timer); if(!paused) timer = setInterval(refresh, 5000); }
+
+function visible(){
+  return items
+    .filter(i => brand === "all" || i.brand === brand)
+    .sort((a,b) => (a.scheduledLocal||a.scheduledAt).localeCompare(b.scheduledLocal||b.scheduledAt));
+}
+function countStatus(){
+  const c = {geplant:0, fertig:0, problem:0};
+  for(const i of items){
+    const [label] = statusOf(i);
+    if(label === "Veröffentlicht") c.fertig++;
+    else if(label === "Fehler" || label === "Prüfen") c.problem++;
+    else c.geplant++;
+  }
+  $("#stats").innerHTML = `<span><b>${c.geplant}</b> geplant</span><span><b>${c.fertig}</b> veröffentlicht</span>${c.problem?`<span style="color:var(--err)"><b>${c.problem}</b> prüfen</span>`:""}`;
+}
+function card(item, withThumb){
+  const [sLabel] = statusOf(item);
+  const slides = item.media.slides;
+  const mediaRef = slides ? slides[0] : item.media;
+  const isVideo = /video/.test(mediaRef.contentType || "");
+  const thumb = withThumb ? `<img class="thumb" loading="lazy" src="/api/media?fp=${item.fingerprint}&slide=0&t=${item.updatedAt||""}" onerror="this.style.visibility='hidden'">` : "";
+  const k = slides ? `${KIND[item.kind]} · ${slides.length} Teile` : KIND[item.kind];
+  return `<div class="card ${item.brand==="werkstern"?"WS":"MZM"}" data-fp="${item.fingerprint}">
+    <div class="time">${timeOf(item)}</div>
+    ${thumb}
+    <div class="body">
+      <div class="title"><span class="badge ${item.brand==="werkstern"?"WS":"MZM"}">${item.brand==="werkstern"?"Werkstern":"Massage-Zuhause"}</span>
+      <span class="kind">${k} · ${timeOf(item)} Uhr</span> ${statusBadge(item)}</div>
+      <div class="cap">${shortCap(item.caption).replace(/</g,"&lt;")}</div>
+    </div></div>`;
+}
+function mini(item){
+  const [sLabel, sCls] = statusOf(item);
+  return `<div class="mini" style="border-left-color:${sCls==="published"?"var(--ok)":sCls==="failed"?"var(--err)":sCls==="publishing"?"var(--run)":"var(--ws2)"}" data-fp="${item.fingerprint}">
+    <span class="t">${timeOf(item)}</span>
+    <span class="k">${item.brand==="werkstern"?"WS":"MZM"} ${KIND[item.kind]||item.kind}${sCls==="published"?" ✓":""}</span></div>`;
+}
+function render(){
+  countStatus();
+  const main = $("#main");
+  const list = visible();
+  if(view === "month"){
+    const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+    const start = new Date(first); start.setDate(1 - ((first.getDay()+6)%7));
+    $("#label").textContent = `${MONTHS[cursor.getMonth()]} ${cursor.getFullYear()}`;
+    let html = `<div id="month">` + DOW.map(d=>`<div class="dow">${d}</div>`).join("");
+    for(let i=0;i<42;i++){
+      const d = new Date(start); d.setDate(start.getDate()+i);
+      const day = isoDay(d);
+      const dayItems = list.filter(x => dayOf(x) === day);
+      html += `<div class="cell ${day===isoDay(new Date())?"today":""} ${d.getMonth()!==cursor.getMonth()?"out":""}">
+        <div class="d">${d.getDate()}.</div>
+        ${dayItems.slice(0,4).map(mini).join("")}
+        ${dayItems.length>4?`<div class="more">+${dayItems.length-4} weitere</div>`:""}</div>`;
+    }
+    main.innerHTML = html + `</div>`;
+  } else if(view === "week"){
+    const start = new Date(cursor); start.setDate(cursor.getDate() - ((cursor.getDay()+6)%7));
+    $("#label").textContent = `${start.getDate()}.–${new Date(start.getTime()+6*864e5).getDate()}. ${MONTHS[start.getMonth()]}`;
+    let html = `<div id="week">`;
+    for(let i=0;i<7;i++){
+      const d = new Date(start); d.setDate(start.getDate()+i);
+      const day = isoDay(d);
+      const dayItems = list.filter(x => dayOf(x) === day);
+      html += `<div class="col ${day===isoDay(new Date())?"today":""}"><div class="hd">${DOW[i]} ${d.getDate()}.</div><div class="bd">
+        ${dayItems.map(c=>card(c,false)).join("") || `<div class="empty" style="padding:14px 0">—</div>`}</div></div>`;
+    }
+    main.innerHTML = html + `</div>`;
+  } else {
+    const day = isoDay(cursor);
+    $("#label").textContent = `${DOW[(cursor.getDay()+6)%7]}, ${cursor.getDate()}. ${MONTHS[cursor.getMonth()]}`;
+    const dayItems = list.filter(x => dayOf(x) === day);
+    main.innerHTML = `<div id="day">${dayItems.map(c=>card(c,true)).join("") || `<div class="empty">Keine Uploads an diesem Tag.</div>`}</div>`;
+  }
+  main.querySelectorAll("[data-fp]").forEach(el => el.onclick = () => openModal(el.dataset.fp));
+}
+function openModal(fp){
+  sel = items.find(i => i.fingerprint.startsWith(fp)) || null; slide = 0;
+  if(!sel) return;
+  drawModal();
+  $("#modal").classList.add("open");
+}
+function drawModal(){
+  const i = sel; if(!i) return;
+  const entries = i.media.slides || [i.media];
+  if(slide >= entries.length) slide = 0;
+  const media = entries[slide];
+  const isVideo = /video/.test(media.contentType||"");
+  const src = `/api/media?fp=${i.fingerprint}&slide=${slide}&t=${Date.now()}`;
+  const [sLabel] = statusOf(i);
+  $("#mbox").innerHTML = `
+    <h2>${i.brand==="werkstern"?"Werkstern":"Massage-Zuhause"} · ${KIND[i.kind]||i.kind} ${statusBadge(i)}</h2>
+    ${entries.length>1?`<div class="slides">${entries.map((s,idx)=>`<img data-slide="${idx}" class="${idx===slide?"sel":""}" src="/api/media?fp=${i.fingerprint}&slide=${idx}&t=${Date.now()}">`).join("")}</div>`:""}
+    ${isVideo?`<video class="media" src="${src}" controls autoplay muted></video>`:`<img class="media" src="${src}">`}
+    <div class="meta">
+      <span>Termin</span><b>${(i.scheduledLocal||i.scheduledAt).replace("T"," um ")} Uhr</b>
+      <span>Status</span><b>${sLabel}</b>
+      <span>Kanal</span><b>${i.platforms.map(p=>p==="instagram"?"Instagram":"Facebook").join(" + ")}</b>
+      <span>Paket</span><b style="word-break:break-all">${(i.source||"—").replace(/</g,"&lt;")}</b>
+      <span>Fingerprint</span><b>${i.fingerprint.slice(0,16)}…</b>
+    </div>
+    <div class="cap">${(i.caption||"").replace(/</g,"&lt;")}</div>
+    <div class="actions">
+      <button class="ghost" id="openFile">📄 Datei öffnen</button>
+      <button class="ghost" id="openFolder">📁 Im Explorer anzeigen</button>
+      <button class="ghost" id="closeM">Schließen</button>
+    </div>`;
+  $("#mbox").querySelectorAll(".slides img").forEach(img => img.onclick = () => { slide = Number(img.dataset.slide); drawModal(); });
+  $("#openFile").onclick = () => fetch("/api/open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({fp:i.fingerprint,slide,target:"file"})}).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);});
+  $("#openFolder").onclick = () => fetch("/api/open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({fp:i.fingerprint,slide,target:"folder"})}).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);});
+  $("#closeM").onclick = closeModal;
+}
+function closeModal(){ $("#modal").classList.remove("open"); sel = null; }
+$("#modal").onclick = (e) => { if(e.target.id === "modal") closeModal(); };
+document.addEventListener("keydown", e => { if(e.key === "Escape") closeModal(); });
+$("#views").querySelectorAll("button").forEach(b => b.onclick = () => {
+  view = b.dataset.v;
+  $("#views").querySelectorAll("button").forEach(x=>x.classList.toggle("active", x===b));
+  render();
+});
+document.querySelectorAll(".chip[data-b]").forEach(c => c.onclick = () => {
+  brand = c.dataset.b;
+  document.querySelectorAll(".chip[data-b]").forEach(x=>x.classList.toggle("active", x===c));
+  render();
+});
+const move = (n) => {
+  if(view === "month") cursor = new Date(cursor.getFullYear(), cursor.getMonth()+n, 1);
+  else cursor.setDate(cursor.getDate() + n*(view==="week"?7:1));
+  render();
+};
+$("#prev").onclick = () => move(-1);
+$("#next").onclick = () => move(1);
+$("#today").onclick = () => { cursor = new Date(); render(); };
+$("#pause").onclick = () => { paused = !paused; $("#pause").textContent = paused?"Weiter":"Pause"; $("#live").classList.toggle("paused",paused); if(paused){clearInterval(timer);}else{startPoll();refresh();} };
+$("#fs").onclick = () => { if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); };
+startPoll(); refresh();
+</script>
+</body>
+</html>
