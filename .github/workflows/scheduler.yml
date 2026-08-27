@@ -2,29 +2,30 @@ name: publish-due
 
 on:
   schedule:
-    - cron: "3-58/5 * * * *"   # alle 5 Minuten, versetzt (volle Slots sind am staerksten ausgelastet)
-    - cron: "7 3 * * *"        # taeglich: Keepalive-Commit (GitHub deaktiviert Cron-Workflows nach 60 Tagen Inaktivitaet)
+    - cron: "3-58/5 * * * *"   # Bonus-Takt, falls GitHub den Zeitplan ausliefert (oft verzögert)
   workflow_dispatch:
     inputs:
       mode:
-        description: "check = nur Prueflauf, run = veröffentlichen"
+        description: "loop = Dauerwachdienst (Selbst-Nachfolger), run = einmal veröffentlichen, check = nur Prüflauf"
         type: choice
-        default: check
+        default: loop
         options:
-          - check
+          - loop
           - run
+          - check
 
 permissions:
   contents: write
-
-concurrency:
-  group: publish-due
-  cancel-in-progress: false
+  actions: write
 
 jobs:
-  scheduler:
+  publish:
+    if: github.event_name == 'schedule' || inputs.mode == 'run'
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    concurrency:
+      group: publish-due
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -38,11 +39,72 @@ jobs:
           META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
           META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
           META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
-        run: node publish-cloud.mjs --${{ inputs.mode || 'run' }}
-      - name: Daily keepalive commit
-        if: github.event.schedule == '7 3 * * *'
+        run: node publish-cloud.mjs
+
+  loop:
+    if: inputs.mode == 'loop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    concurrency:
+      group: publish-due
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish loop (5,5 h Wachdienst, danach Selbst-Nachfolger)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
+          META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
+          META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
+          META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
+          META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+        run: |
+          deadline=$(( $(date +%s) + 330*60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            node publish-cloud.mjs || true
+            sleep 150
+          done
+          gh workflow run scheduler.yml --ref main -f mode=loop
+          echo "Nachfolger gestartet."
+
+  check:
+    if: inputs.mode == 'check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Connectivity check
+        env:
+          META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
+          META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
+          META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
+          META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
+          META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+        run: node publish-cloud.mjs --check
+
+  keepalive:
+    if: github.event_name == 'schedule' && github.event.schedule == '7 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: keepalive
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Daily keepalive commit + Loop-Bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "scheduler-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "keepalive [skip ci]"
           git push
+          gh workflow run scheduler.yml --ref main -f mode=loop || true

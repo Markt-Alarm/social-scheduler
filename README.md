@@ -20,7 +20,11 @@ Der PC wird nur für Produktion, Sichtung und Freigabe gebraucht. Alles Danach l
   - `node publish-cloud.mjs` — veröffentlichen (Workflow-Default)
   - `node publish-cloud.mjs --check` — Konnektivität, Medien und Tokens prüfen, ohne etwas zu veröffentlichen
 - `seed-cloud-queue.mjs` — lokal ausführen nach der Freigabe. Liest `.upload-state/items` (Status `SCHEDULED`, `liveIntent`), lädt Medien nach R2 und übernimmt die Termine in die Cloud-Queue. Idempotent: erneutes Ausführen aktualisiert bestehende Einträge, abgeschlossene Status bleiben erhalten.
-- `cloud-lib.mjs` — R2-SigV4-Client und die Meta-Publishing-Routen (Instagram Post/Story/Reel/Video, Facebook Foto/Video/Reel), portiert aus dem upload-Skill.
+- `cloud-lib.mjs` — R2-SigV4-Client und die Meta-Publishing-Routen (Instagram Post/Story/Reel/Video/Carousel, Facebook Foto/Video/Reel/Carousel), portiert aus dem upload-Skill.
+- Workflow `publish-due` mit drei Modi:
+  - `loop` (Standard, Selbst-Nachfolger): Der Job läuft 5,5 Stunden als Wachdienst (Prüflauf alle 2,5 Minuten) und startet vor Ablauf selbst den nächsten Loop-Lauf. Dadurch tickt der Scheduler garantiert ohne Cron-Abhängigkeit; ein täglicher Keepalive-Job bootet zusätzlich neu und hält den Workflow gegen die 60-Tage-Inaktivitäts-Abschaltung wach.
+  - `run`: einmaliger Veröffentlichungslauf (auch als Cron-Bonus aktiv, falls GitHub den Zeitplan ausliefert).
+  - `check`: Prüflauf ohne Mutationen.
 
 ## Sicherheitsregeln (unveränderlich)
 
