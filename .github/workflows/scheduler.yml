@@ -1,0 +1,48 @@
+name: publish-due
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # alle 5 Minuten: faellige Posts veroeffentlichen
+    - cron: "7 3 * * *"     # taeglich: Keepalive-Commit (GitHub deaktiviert Cron-Workflows nach 60 Tagen Inaktivitaet)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = nur Prueflauf, run = veröffentlichen"
+        type: choice
+        default: check
+        options:
+          - check
+          - run
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-due
+  cancel-in-progress: false
+
+jobs:
+  scheduler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish due items
+        env:
+          META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
+          META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
+          META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
+          META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
+          META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+        run: node publish-cloud.mjs --${{ inputs.mode || 'run' }}
+      - name: Daily keepalive commit
+        if: github.event.schedule == '7 3 * * *'
+        run: |
+          git config user.name "scheduler-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive [skip ci]"
+          git push
