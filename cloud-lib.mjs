@@ -38,14 +38,16 @@ const CONTENT_TYPES = new Map([
   [".jpeg", "image/jpeg"],
   [".png", "image/png"],
   [".mp4", "video/mp4"],
-  [".mov", "video/quicktime"]
+  [".mov", "video/quicktime"],
+  [".webm", "video/webm"]
 ]);
 
 export function r2Credentials() {
-  const accessKeyId = process.env.META_R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.META_R2_SECRET_ACCESS_KEY;
-  const endpointRaw = process.env.META_R2_ENDPOINT;
-  const bucket = process.env.META_R2_BUCKET_NAME;
+  const configured = (...values) => values.find((value) => typeof value === "string" && value.trim());
+  const accessKeyId = configured(process.env.SOCIAL_R2_ACCESS_KEY_ID, process.env.META_R2_ACCESS_KEY_ID);
+  const secretAccessKey = configured(process.env.SOCIAL_R2_SECRET_ACCESS_KEY, process.env.META_R2_SECRET_ACCESS_KEY);
+  const endpointRaw = configured(process.env.SOCIAL_R2_ENDPOINT, process.env.META_R2_ENDPOINT);
+  const bucket = configured(process.env.SOCIAL_R2_BUCKET_NAME, process.env.META_R2_BUCKET_NAME);
   if (![accessKeyId, secretAccessKey, endpointRaw, bucket].every((value) => typeof value === "string" && value.trim())) {
     fail("required R2 environment variables are missing");
   }
@@ -55,8 +57,12 @@ export function r2Credentials() {
   } catch {
     fail("R2 endpoint is invalid");
   }
+  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/" || (endpoint.port && endpoint.port !== "443")) {
+    fail("R2 endpoint must be a credential-free HTTPS origin");
+  }
+  if (!endpoint.hostname.endsWith(".r2.cloudflarestorage.com")) fail("R2 endpoint host is unexpected");
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket.trim())) fail("R2 bucket name is invalid");
-  return { accessKeyId: accessKeyId.trim(), secretAccessKey: secretAccessKey.trim(), endpoint, bucket: bucket.trim() };
+  return { accessKeyId: accessKeyId.trim(), secretAccessKey, endpoint, bucket: bucket.trim() };
 }
 
 export function contentTypeFor(extension) {
@@ -189,7 +195,8 @@ export async function headObject(credentials, objectKey) {
   return {
     exists: true,
     bytes: Number.isSafeInteger(bytes) ? bytes : -1,
-    sha256: response.headers.get("x-amz-meta-sha256") ?? ""
+    sha256: response.headers.get("x-amz-meta-sha256") ?? "",
+    etag: response.headers.get("etag") ?? ""
   };
 }
 
@@ -229,6 +236,11 @@ export async function putObjectFile(credentials, upload) {
 }
 
 export async function getObjectText(credentials, objectKey) {
+  const result = await getObjectTextWithEtag(credentials, objectKey);
+  return result?.text ?? null;
+}
+
+export async function getObjectTextWithEtag(credentials, objectKey) {
   const response = await signedFetchWithRetry(credentials, {
     method: "GET",
     objectKey,
@@ -236,24 +248,39 @@ export async function getObjectText(credentials, objectKey) {
   });
   if (response.status === 404) return null;
   if (!response.ok) fail(`R2 GET returned HTTP ${response.status}`);
-  return await response.text();
+  return { text: await response.text(), etag: response.headers.get("etag") ?? "" };
 }
 
 export async function putObjectText(credentials, objectKey, text, contentType = "application/json") {
+  const result = await putObjectTextConditional(credentials, objectKey, text, { contentType });
+  if (!result.written) fail(`R2 PUT was rejected by a conditional write (HTTP ${result.status})`);
+}
+
+export async function putObjectTextConditional(credentials, objectKey, text, options = {}) {
   const payload = Buffer.from(text, "utf8");
   const sha256 = crypto.createHash("sha256").update(payload).digest("hex");
+  const conditionalHeaders = {};
+  if (options.ifMatch) conditionalHeaders["if-match"] = options.ifMatch;
+  if (options.ifNoneMatch) conditionalHeaders["if-none-match"] = options.ifNoneMatch;
   const response = await signedFetchWithRetry(credentials, {
     method: "PUT",
     objectKey,
     payloadHash: sha256,
     headers: {
       "content-length": String(payload.byteLength),
-      "content-type": contentType
+      "content-type": options.contentType ?? "application/json",
+      ...conditionalHeaders
     },
     body: payload
   });
+  if (response.status === 409 || response.status === 412) {
+    await response.body?.cancel().catch(() => {});
+    return { written: false, conflict: true, status: response.status };
+  }
   if (!response.ok) fail(`R2 PUT returned HTTP ${response.status}`);
+  const etag = response.headers.get("etag") ?? "";
   await response.body?.cancel().catch(() => {});
+  return { written: true, conflict: false, status: response.status, etag };
 }
 
 export function presignGet(credentials, objectKey, ttlSeconds) {
@@ -286,7 +313,7 @@ export function graphConfig() {
   return {
     graphApi: {
       baseUrl: "https://graph.facebook.com",
-      version: "v23.0",
+      version: "v26.0",
       requestTimeoutSeconds: 45,
       pollIntervalSeconds: 20,
       pollTimeoutSeconds: 300,
@@ -397,7 +424,27 @@ async function publishMutationOnce(context, request) {
     }
     throw new QaBlockedError(`${request.label} was rejected by Meta.`, { httpStatus: response.status, ...parsed });
   }
-  return parseJsonResponse(response, request.label);
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new AmbiguousMutationError(`${request.label} returned an unparseable success response.`, { httpStatus: response.status });
+  }
+  const expectedIdFields = request.expectedIdFields ?? [];
+  const hasExpectedId = expectedIdFields.some((field) => {
+    const value = data?.[field];
+    return (typeof value === "string" || typeof value === "number") && String(value).trim() !== "";
+  });
+  if (expectedIdFields.length > 0 && !hasExpectedId) {
+    throw new AmbiguousMutationError(`${request.label} returned no expected publication ID.`, {
+      httpStatus: response.status,
+      expectedIdFields
+    });
+  }
+  if (request.requireSuccess === true && data?.success !== true) {
+    throw new AmbiguousMutationError(`${request.label} returned no positive publication confirmation.`, { httpStatus: response.status });
+  }
+  return data;
 }
 
 async function pollInstagramContainer(context, containerId, { allowFinished = true } = {}) {
@@ -491,13 +538,13 @@ async function publishInstagram(context, socialPackage, account, mediaUrl, initi
       method: "POST",
       url: context.graphUrl(account.instagramAccountId, "media_publish"),
       form: { creation_id: state.containerId },
-      label: "Instagram media publish"
+      label: "Instagram media publish",
+      expectedIdFields: ["id"]
     });
   } catch (error) {
     if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
     throw error;
   }
-  if (!response.id) throw new QaBlockedError("Instagram media publish returned no media id.");
   await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.id), publishedAt: new Date().toISOString() });
   return state;
 }
@@ -516,13 +563,13 @@ async function publishFacebookPhoto(context, socialPackage, account, mediaUrl, i
       method: "POST",
       url: context.graphUrl(account.pageId, "photos"),
       form: { url: mediaUrl, caption: socialPackage.caption, published: "true" },
-      label: "Facebook photo publish"
+      label: "Facebook photo publish",
+      expectedIdFields: ["id", "post_id"]
     });
   } catch (error) {
     if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
     throw error;
   }
-  if (!response.id && !response.post_id) throw new QaBlockedError("Facebook photo publish returned no object id.");
   await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.post_id ?? response.id), publishedAt: new Date().toISOString() });
   return state;
 }
@@ -585,13 +632,13 @@ async function publishFacebookVideo(context, socialPackage, account, mediaUrl, i
         method: "POST",
         url: context.graphUrl(account.pageId, "videos"),
         form: { file_url: mediaUrl, description: socialPackage.caption, published: "true" },
-        label: "Facebook Page video publish"
+        label: "Facebook Page video publish",
+        expectedIdFields: ["id"]
       });
     } catch (error) {
       if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
       throw error;
     }
-    if (!response.id) throw new QaBlockedError("Facebook video publish returned no video id.");
     await save({ status: "SUBMITTED", publishPhase: "CONFIRMED", videoId: String(response.id) });
   }
   const result = await pollFacebookVideo(context, state.videoId);
@@ -674,7 +721,8 @@ async function publishFacebookReel(context, socialPackage, account, mediaUrl, in
         description: socialPackage.caption,
         title: socialPackage.options.facebook.title
       },
-      label: "Facebook Reel finish/publish"
+      label: "Facebook Reel finish/publish",
+      requireSuccess: true
     });
   } catch (error) {
     if (error.ambiguous) await save({ status: "AMBIGUOUS", finishPhase: "AMBIGUOUS", blockedReason: error.message });
@@ -741,13 +789,13 @@ async function publishInstagramCarousel(context, socialPackage, account, mediaUr
       method: "POST",
       url: context.graphUrl(account.instagramAccountId, "media_publish"),
       form: { creation_id: state.containerId },
-      label: "Instagram carousel publish"
+      label: "Instagram carousel publish",
+      expectedIdFields: ["id"]
     });
   } catch (error) {
     if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
     throw error;
   }
-  if (!response.id) throw new QaBlockedError("Instagram carousel publish returned no media id.");
   await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.id), publishedAt: new Date().toISOString() });
   return state;
 }
@@ -786,13 +834,13 @@ async function publishFacebookCarousel(context, socialPackage, account, mediaUrl
         method: "POST",
         url: context.graphUrl(account.pageId, "feed"),
         form,
-        label: "Facebook carousel feed publish"
+        label: "Facebook carousel feed publish",
+        expectedIdFields: ["id", "post_id"]
       });
     } catch (error) {
       if (error.ambiguous) await save({ status: "AMBIGUOUS", publishPhase: "AMBIGUOUS", blockedReason: error.message });
       throw error;
     }
-    if (!response.id && !response.post_id) throw new QaBlockedError("Facebook carousel feed publish returned no object id.");
     await save({ status: "PUBLISHED", publishPhase: "CONFIRMED", remoteMediaId: String(response.post_id ?? response.id), publishedAt: new Date().toISOString() });
   }
   return state;

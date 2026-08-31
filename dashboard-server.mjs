@@ -16,6 +16,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getObjectText, headObject, presignGet, r2Credentials } from "./cloud-lib.mjs";
+import { normalizeQueue, redactQueue } from "./queue-store.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SOURCE_ROOT = path.resolve("D:\\Kreativ\\Social Media");
@@ -32,7 +33,7 @@ async function loadQueue() {
   try {
     const text = await getObjectText(credentials, QUEUE_KEY);
     if (text !== null) {
-      cache = { at: Date.now(), queue: JSON.parse(text) };
+      cache = { at: Date.now(), queue: normalizeQueue(JSON.parse(text)) };
     }
   } catch (error) {
     if (!cache.queue) throw error;
@@ -42,7 +43,7 @@ async function loadQueue() {
 
 function contentTypeFor(file) {
   const ext = path.extname(file).toLowerCase();
-  return { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".mp4": "video/mp4", ".mov": "video/quicktime" }[ext] ?? "application/octet-stream";
+  return { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm" }[ext] ?? "application/octet-stream";
 }
 
 async function resolveMedia(fingerprint, slideParam) {
@@ -54,7 +55,8 @@ async function resolveMedia(fingerprint, slideParam) {
   const media = entries[slide];
   if (!media) return { error: "slide unbekannt", status: 404 };
   const localPath = item.source ? path.resolve(item.source, media.path) : null;
-  if (localPath && localPath.startsWith(SOURCE_ROOT)) {
+  const relative = localPath ? path.relative(SOURCE_ROOT, localPath) : "";
+  if (localPath && relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
     const stat = await fsp.stat(localPath).catch(() => null);
     if (stat?.isFile()) return { localPath, size: stat.size };
   }
@@ -120,7 +122,7 @@ const server = http.createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/queue") {
       const queue = await loadQueue();
-      sendJson(response, 200, queue);
+      sendJson(response, 200, redactQueue(queue));
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/media") {

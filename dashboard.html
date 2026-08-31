@@ -69,9 +69,12 @@
   .badge.failed{border-color:#5c3531;color:#f0a29b}
   .badge.publishing,.badge.submitted{border-color:#6b5620;color:#ecd28a}
   .badge.ambiguous{border-color:#4a3570;color:#c7aef0}
+  .badge.partial{border-color:#6b5620;color:#ecd28a}
+  .badge.waiting{border-color:#38546d;color:#9dc8ea}
   .kind{color:var(--muted);font-size:11px}
-  .WS{border-left-color:var(--ws)}
-  .MZM{border-left-color:var(--mzm)}
+  #accounts{display:flex;gap:6px;flex-wrap:wrap}
+  .platforms{display:inline-flex;gap:4px;flex-wrap:wrap}
+  .target-row{display:grid;grid-template-columns:minmax(90px,auto) 1fr;gap:8px;margin:3px 0}
   .empty{color:var(--muted);text-align:center;padding:40px 0}
   /* Modal */
   #modal{position:fixed;inset:0;background:rgba(5,8,12,.72);display:none;align-items:center;justify-content:center;z-index:50}
@@ -99,13 +102,11 @@
   <div class="nav">
     <button id="prev">‹</button><b id="label"></b><button id="next">›</button><button id="today">Heute</button>
   </div>
-  <span class="chip active" data-b="all">Alle</span>
-  <span class="chip" data-b="werkstern"><span class="dot" style="background:var(--ws)"></span>Werkstern</span>
-  <span class="chip" data-b="massage-zuhause"><span class="dot" style="background:var(--mzm)"></span>Massage-Zuhause</span>
+  <div id="accounts"><span class="chip active" data-b="all">Alle</span></div>
   <span class="spacer"></span>
   <div id="stats"></div>
   <div class="live" id="live"><span class="pulse"></span><span id="liveTxt">verbinde…</span></div>
-  <button class="ghost" id="pause">Pause</button>
+  <button class="ghost" id="pause">Live-Aktualisierung pausieren</button>
   <button class="ghost" id="fs">Vollbild</button>
 </header>
 <main id="main"></main>
@@ -113,10 +114,11 @@
 <script>
 "use strict";
 const KIND = {story:"Story",reel:"Reel",carousel:"Carousel",post:"Beitrag",video:"Video"};
-const STATUS = {SCHEDULED:["Geplant",""],PUBLISHING:["Wird veröffentlicht","publishing"],SUBMITTING:["Wird veröffentlicht","publishing"],PUBLISHED:["Veröffentlicht","published"],FAILED:["Fehler","failed"],AMBIGUOUS:["Prüfen","ambiguous"],CONTAINER_CREATED:["In Vorbereitung","publishing"],CHILDREN_UPLOAD:["In Vorbereitung","publishing"],UPLOAD_SESSION:["In Vorbereitung","publishing"],UPLOADED:["In Vorbereitung","publishing"],SUBMITTED:["Wird veröffentlicht","publishing"],PHOTOS_STAGED:["In Vorbereitung","publishing"]};
+const STATUS = {SCHEDULED:["Geplant",""],PENDING:["Geplant",""],RETRY_SCHEDULED:["Erneuter Versuch","waiting"],CLAIMED:["Wird veröffentlicht","publishing"],PUBLISHING:["Wird veröffentlicht","publishing"],SUBMITTING:["Wird veröffentlicht","publishing"],PUBLISHED:["Veröffentlicht","published"],PARTIAL:["Teilweise veröffentlicht","partial"],FAILED:["Fehler","failed"],AMBIGUOUS:["Prüfen","ambiguous"],WAITING_APPROVAL:["Freigabe fehlt","waiting"],ACTION_REQUIRED:["In App abschließen","waiting"],WAITING_CONFIGURATION:["Konfiguration fehlt","waiting"],NEEDS_ACTION:["In App abschließen","waiting"],NEEDS_CONFIGURATION:["Konfiguration fehlt","waiting"],CONTAINER_CREATED:["In Vorbereitung","publishing"],CHILDREN_UPLOAD:["In Vorbereitung","publishing"],UPLOAD_SESSION:["In Vorbereitung","publishing"],UPLOADING:["Upload läuft","publishing"],UPLOADED:["In Vorbereitung","publishing"],PROCESSING:["Verarbeitung läuft","publishing"],SUBMITTED:["Wird veröffentlicht","publishing"],PHOTOS_STAGED:["In Vorbereitung","publishing"]};
+const PLATFORM = {instagram:"Instagram",facebook:"Facebook",youtube:"YouTube",tiktok:"TikTok"};
 const DOW = ["Mo","Di","Mi","Do","Fr","Sa","So"];
 const MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
-let items = [], view = "week", cursor = new Date(), brand = "all", paused = false, timer = null, sel = null, slide = 0;
+let items = [], accounts = {}, view = "week", cursor = new Date(), brand = "all", paused = false, timer = null, sel = null, slide = 0;
 
 const $ = (sel2) => document.querySelector(sel2);
 const pad = (n) => String(n).padStart(2,"0");
@@ -124,13 +126,16 @@ const isoDay = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate
 const dayOf = (item) => (item.scheduledLocal || item.scheduledAt).slice(0,10);
 const timeOf = (item) => (item.scheduledLocal || item.scheduledAt).slice(11,16);
 const shortCap = (c) => (c||"").replace(/\s+/g," ").trim().slice(0,90);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[character]));
+const accountOf = (item) => accounts[item.accountId || item.brand] || {displayName:item.accountId||item.brand,shortName:item.accountId||item.brand,color:"#7891b2"};
+const colorOf = (account) => /^#[0-9a-f]{6}$/i.test(account?.color||"") ? account.color : "#7891b2";
+const targetStatesOf = (item) => Object.values(item.targetStates || item.platformStates || {});
 const statusOf = (item) => {
-  const states = Object.values(item.platformStates || {}).map(s => s.status);
+  if(STATUS[item.status]) return STATUS[item.status];
+  const states = targetStatesOf(item).map(s => s.status);
   if (states.includes("AMBIGUOUS")) return ["Prüfen","ambiguous"];
-  if (states.includes("PUBLISHED")) return ["Veröffentlicht","published"];
-  if (item.status === "PUBLISHED") return ["Veröffentlicht","published"];
-  if (item.status === "FAILED") return ["Fehler","failed"];
-  if (item.status === "AMBIGUOUS") return ["Prüfen","ambiguous"];
+  if (states.length && states.every(s=>s==="PUBLISHED")) return ["Veröffentlicht","published"];
+  if (states.includes("PUBLISHED")) return ["Teilweise veröffentlicht","partial"];
   if (item.status === "PUBLISHING" || states.some(s => s && s !== "PENDING")) return ["In Arbeit","publishing"];
   return STATUS[item.status] || [item.status,""];
 };
@@ -142,7 +147,10 @@ async function refresh(){
   try{
     const res = await fetch("/api/queue");
     if(!res.ok) throw new Error(res.status);
-    items = (await res.json()).items || [];
+    const queue = await res.json();
+    items = queue.items || [];
+    accounts = queue.accounts || {};
+    renderAccounts();
     $("#liveTxt").textContent = "live · " + new Date().toLocaleTimeString("de-DE");
     $("#live").classList.remove("paused");
     render();
@@ -152,6 +160,16 @@ async function refresh(){
   }
 }
 function startPoll(){ clearInterval(timer); if(!paused) timer = setInterval(refresh, 5000); }
+
+function renderAccounts(){
+  const ids = [...new Set([...Object.keys(accounts), ...items.map(item=>item.accountId||item.brand)])];
+  if(brand!=="all" && !ids.includes(brand)) brand="all";
+  $("#accounts").innerHTML = `<span class="chip ${brand==="all"?"active":""}" data-b="all">Alle</span>` + ids.map(id=>{
+    const account = accounts[id] || {displayName:id,color:"#7891b2"};
+    return `<span class="chip ${brand===id?"active":""}" data-b="${esc(id)}"><span class="dot" style="background:${colorOf(account)}"></span>${esc(account.displayName||id)}</span>`;
+  }).join("");
+  $("#accounts").querySelectorAll(".chip[data-b]").forEach(chip=>chip.onclick=()=>{brand=chip.dataset.b;renderAccounts();render();});
+}
 
 function visible(){
   return items
@@ -163,32 +181,34 @@ function countStatus(){
   for(const i of items){
     const [label] = statusOf(i);
     if(label === "Veröffentlicht") c.fertig++;
-    else if(label === "Fehler" || label === "Prüfen") c.problem++;
+    else if(["Fehler","Prüfen","Teilweise veröffentlicht","Freigabe fehlt","In App abschließen","Konfiguration fehlt"].includes(label)) c.problem++;
     else c.geplant++;
   }
   $("#stats").innerHTML = `<span><b>${c.geplant}</b> geplant</span><span><b>${c.fertig}</b> veröffentlicht</span>${c.problem?`<span style="color:var(--err)"><b>${c.problem}</b> prüfen</span>`:""}`;
 }
 function card(item, withThumb){
-  const [sLabel] = statusOf(item);
+  const account = accountOf(item);
   const slides = item.media.slides;
   const mediaRef = slides ? slides[0] : item.media;
   const isVideo = /video/.test(mediaRef.contentType || "");
-  const thumb = withThumb ? `<img class="thumb" loading="lazy" src="/api/media?fp=${item.fingerprint}&slide=0&t=${item.updatedAt||""}" onerror="this.style.visibility='hidden'">` : "";
+  const thumb = withThumb ? (isVideo ? `<video class="thumb" muted preload="metadata" src="/api/media?fp=${encodeURIComponent(item.fingerprint)}&slide=0&t=${encodeURIComponent(item.updatedAt||"")}"></video>` : `<img class="thumb" loading="lazy" src="/api/media?fp=${encodeURIComponent(item.fingerprint)}&slide=0&t=${encodeURIComponent(item.updatedAt||"")}" onerror="this.style.visibility='hidden'">`) : "";
   const k = slides ? `${KIND[item.kind]} · ${slides.length} Teile` : KIND[item.kind];
-  return `<div class="card ${item.brand==="werkstern"?"WS":"MZM"}" data-fp="${item.fingerprint}">
+  const channels = item.platforms.map(platform=>PLATFORM[platform]||platform).join(" + ");
+  return `<div class="card" style="border-left-color:${colorOf(account)}" data-fp="${esc(item.fingerprint)}">
     <div class="time">${timeOf(item)}</div>
     ${thumb}
     <div class="body">
-      <div class="title"><span class="badge ${item.brand==="werkstern"?"WS":"MZM"}">${item.brand==="werkstern"?"Werkstern":"Massage-Zuhause"}</span>
-      <span class="kind">${k} · ${timeOf(item)} Uhr</span> ${statusBadge(item)}</div>
-      <div class="cap">${shortCap(item.caption).replace(/</g,"&lt;")}</div>
+      <div class="title"><span class="badge" style="border-color:${colorOf(account)};color:${colorOf(account)}">${esc(account.displayName)}</span>
+      <span class="kind">${esc(k)} · ${timeOf(item)} Uhr · ${esc(channels)}</span> ${statusBadge(item)}</div>
+      <div class="cap">${esc(shortCap(item.caption))}</div>
     </div></div>`;
 }
 function mini(item){
   const [sLabel, sCls] = statusOf(item);
+  const account = accountOf(item);
   return `<div class="mini" style="border-left-color:${sCls==="published"?"var(--ok)":sCls==="failed"?"var(--err)":sCls==="publishing"?"var(--run)":"var(--ws2)"}" data-fp="${item.fingerprint}">
     <span class="t">${timeOf(item)}</span>
-    <span class="k">${item.brand==="werkstern"?"WS":"MZM"} ${KIND[item.kind]||item.kind}${sCls==="published"?" ✓":""}</span></div>`;
+    <span class="k">${esc(account.shortName||account.displayName)} ${esc(KIND[item.kind]||item.kind)}${sCls==="published"?" ✓":""}</span></div>`;
 }
 function render(){
   countStatus();
@@ -237,24 +257,31 @@ function openModal(fp){
 }
 function drawModal(){
   const i = sel; if(!i) return;
+  const account = accountOf(i);
   const entries = i.media.slides || [i.media];
   if(slide >= entries.length) slide = 0;
   const media = entries[slide];
   const isVideo = /video/.test(media.contentType||"");
   const src = `/api/media?fp=${i.fingerprint}&slide=${slide}&t=${Date.now()}`;
   const [sLabel] = statusOf(i);
+  const targetRows = (i.targets||i.platforms.map(platform=>({id:platform,platform}))).map(target=>{
+    const state = i.targetStates?.[target.id] || i.platformStates?.[target.platform] || {status:"PENDING"};
+    const [label,cls] = STATUS[state.status] || [state.status,""];
+    return `<div class="target-row"><span>${esc(PLATFORM[target.platform]||target.platform)}</span><b><span class="badge ${cls}">${esc(label)}</span></b></div>`;
+  }).join("");
   $("#mbox").innerHTML = `
-    <h2>${i.brand==="werkstern"?"Werkstern":"Massage-Zuhause"} · ${KIND[i.kind]||i.kind} ${statusBadge(i)}</h2>
+    <h2>${esc(account.displayName)} · ${esc(KIND[i.kind]||i.kind)} ${statusBadge(i)}</h2>
     ${entries.length>1?`<div class="slides">${entries.map((s,idx)=>`<img data-slide="${idx}" class="${idx===slide?"sel":""}" src="/api/media?fp=${i.fingerprint}&slide=${idx}&t=${Date.now()}">`).join("")}</div>`:""}
     ${isVideo?`<video class="media" src="${src}" controls autoplay muted></video>`:`<img class="media" src="${src}">`}
     <div class="meta">
       <span>Termin</span><b>${(i.scheduledLocal||i.scheduledAt).replace("T"," um ")} Uhr</b>
       <span>Status</span><b>${sLabel}</b>
-      <span>Kanal</span><b>${i.platforms.map(p=>p==="instagram"?"Instagram":"Facebook").join(" + ")}</b>
-      <span>Paket</span><b style="word-break:break-all">${(i.source||"—").replace(/</g,"&lt;")}</b>
+      <span>Kanäle</span><b>${i.platforms.map(p=>esc(PLATFORM[p]||p)).join(" + ")}</b>
+      <span>Zielstatus</span><b>${targetRows}</b>
+      <span>Paket</span><b style="word-break:break-all">${esc(i.source||"—")}</b>
       <span>Fingerprint</span><b>${i.fingerprint.slice(0,16)}…</b>
     </div>
-    <div class="cap">${(i.caption||"").replace(/</g,"&lt;")}</div>
+    <div class="cap">${esc(i.caption||"")}</div>
     <div class="actions">
       <button class="ghost" id="openFile">📄 Datei öffnen</button>
       <button class="ghost" id="openFolder">📁 Im Explorer anzeigen</button>
@@ -273,11 +300,6 @@ $("#views").querySelectorAll("button").forEach(b => b.onclick = () => {
   $("#views").querySelectorAll("button").forEach(x=>x.classList.toggle("active", x===b));
   render();
 });
-document.querySelectorAll(".chip[data-b]").forEach(c => c.onclick = () => {
-  brand = c.dataset.b;
-  document.querySelectorAll(".chip[data-b]").forEach(x=>x.classList.toggle("active", x===c));
-  render();
-});
 const move = (n) => {
   if(view === "month") cursor = new Date(cursor.getFullYear(), cursor.getMonth()+n, 1);
   else cursor.setDate(cursor.getDate() + n*(view==="week"?7:1));
@@ -286,7 +308,7 @@ const move = (n) => {
 $("#prev").onclick = () => move(-1);
 $("#next").onclick = () => move(1);
 $("#today").onclick = () => { cursor = new Date(); render(); };
-$("#pause").onclick = () => { paused = !paused; $("#pause").textContent = paused?"Weiter":"Pause"; $("#live").classList.toggle("paused",paused); if(paused){clearInterval(timer);}else{startPoll();refresh();} };
+$("#pause").onclick = () => { paused = !paused; $("#pause").textContent = paused?"Live-Aktualisierung fortsetzen":"Live-Aktualisierung pausieren"; $("#liveTxt").textContent = paused?"Anzeige-Aktualisierung pausiert":"aktualisiere…"; $("#live").classList.toggle("paused",paused); if(paused){clearInterval(timer);}else{startPoll();refresh();} };
 $("#fs").onclick = () => { if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); };
 startPoll(); refresh();
 </script>

@@ -15,7 +15,7 @@ on:
           - check
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 jobs:
@@ -33,12 +33,22 @@ jobs:
           node-version: 22
       - name: Publish due items
         env:
+          SOCIAL_R2_ACCESS_KEY_ID: ${{ secrets.SOCIAL_R2_ACCESS_KEY_ID }}
+          SOCIAL_R2_SECRET_ACCESS_KEY: ${{ secrets.SOCIAL_R2_SECRET_ACCESS_KEY }}
+          SOCIAL_R2_ENDPOINT: ${{ secrets.SOCIAL_R2_ENDPOINT }}
+          SOCIAL_R2_BUCKET_NAME: ${{ secrets.SOCIAL_R2_BUCKET_NAME }}
           META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
           META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
           META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
           META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          SOCIAL_R2_PUBLIC_BASE_URL: ${{ secrets.SOCIAL_R2_PUBLIC_BASE_URL }}
+          SOCIAL_R2_PUBLIC_SIGNING_SECRET: ${{ secrets.SOCIAL_R2_PUBLIC_SIGNING_SECRET }}
           META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
           META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+          YOUTUBE_WERKSTERN_CLIENT_ID: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_ID }}
+          YOUTUBE_WERKSTERN_CLIENT_SECRET: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_SECRET }}
+          YOUTUBE_WERKSTERN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_WERKSTERN_REFRESH_TOKEN }}
+          SOCIAL_PROVIDER_CREDENTIALS_JSON: ${{ secrets.SOCIAL_PROVIDER_CREDENTIALS_JSON }}
         run: node publish-cloud.mjs
 
   loop:
@@ -56,20 +66,37 @@ jobs:
       - name: Publish loop (5,5 h Wachdienst, danach Selbst-Nachfolger)
         env:
           GH_TOKEN: ${{ github.token }}
+          SOCIAL_R2_ACCESS_KEY_ID: ${{ secrets.SOCIAL_R2_ACCESS_KEY_ID }}
+          SOCIAL_R2_SECRET_ACCESS_KEY: ${{ secrets.SOCIAL_R2_SECRET_ACCESS_KEY }}
+          SOCIAL_R2_ENDPOINT: ${{ secrets.SOCIAL_R2_ENDPOINT }}
+          SOCIAL_R2_BUCKET_NAME: ${{ secrets.SOCIAL_R2_BUCKET_NAME }}
           META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
           META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
           META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
           META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          SOCIAL_R2_PUBLIC_BASE_URL: ${{ secrets.SOCIAL_R2_PUBLIC_BASE_URL }}
+          SOCIAL_R2_PUBLIC_SIGNING_SECRET: ${{ secrets.SOCIAL_R2_PUBLIC_SIGNING_SECRET }}
           META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
           META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+          YOUTUBE_WERKSTERN_CLIENT_ID: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_ID }}
+          YOUTUBE_WERKSTERN_CLIENT_SECRET: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_SECRET }}
+          YOUTUBE_WERKSTERN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_WERKSTERN_REFRESH_TOKEN }}
+          SOCIAL_PROVIDER_CREDENTIALS_JSON: ${{ secrets.SOCIAL_PROVIDER_CREDENTIALS_JSON }}
         run: |
           deadline=$(( $(date +%s) + 330*60 ))
+          failures=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            node publish-cloud.mjs || true
+            if ! node publish-cloud.mjs; then
+              failures=$((failures + 1))
+            fi
             sleep 150
           done
           gh workflow run scheduler.yml --ref main -f mode=loop
           echo "Nachfolger gestartet."
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::$failures Publisher-Lauf/Laeufe sind fehlgeschlagen."
+            exit 1
+          fi
 
   check:
     if: inputs.mode == 'check'
@@ -82,29 +109,22 @@ jobs:
           node-version: 22
       - name: Connectivity check
         env:
+          SOCIAL_R2_ACCESS_KEY_ID: ${{ secrets.SOCIAL_R2_ACCESS_KEY_ID }}
+          SOCIAL_R2_SECRET_ACCESS_KEY: ${{ secrets.SOCIAL_R2_SECRET_ACCESS_KEY }}
+          SOCIAL_R2_ENDPOINT: ${{ secrets.SOCIAL_R2_ENDPOINT }}
+          SOCIAL_R2_BUCKET_NAME: ${{ secrets.SOCIAL_R2_BUCKET_NAME }}
           META_R2_ACCESS_KEY_ID: ${{ secrets.META_R2_ACCESS_KEY_ID }}
           META_R2_SECRET_ACCESS_KEY: ${{ secrets.META_R2_SECRET_ACCESS_KEY }}
           META_R2_ENDPOINT: ${{ secrets.META_R2_ENDPOINT }}
           META_R2_BUCKET_NAME: ${{ secrets.META_R2_BUCKET_NAME }}
+          SOCIAL_R2_PUBLIC_BASE_URL: ${{ secrets.SOCIAL_R2_PUBLIC_BASE_URL }}
+          SOCIAL_R2_PUBLIC_SIGNING_SECRET: ${{ secrets.SOCIAL_R2_PUBLIC_SIGNING_SECRET }}
           META_WERKSTERN_PAGE_ACCESS_TOKEN: ${{ secrets.META_WERKSTERN_PAGE_ACCESS_TOKEN }}
           META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN: ${{ secrets.META_MASSAGE_ZUHAUSE_PAGE_ACCESS_TOKEN }}
+          YOUTUBE_WERKSTERN_CLIENT_ID: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_ID }}
+          YOUTUBE_WERKSTERN_CLIENT_SECRET: ${{ secrets.YOUTUBE_WERKSTERN_CLIENT_SECRET }}
+          YOUTUBE_WERKSTERN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_WERKSTERN_REFRESH_TOKEN }}
+          SOCIAL_YOUTUBE_CHECKS_JSON: >-
+            [{"accountId":"werkstern","channelId":"UCj8GnTQGM6dDBdR29QRL4gQ","clientIdEnv":"YOUTUBE_WERKSTERN_CLIENT_ID","clientSecretEnv":"YOUTUBE_WERKSTERN_CLIENT_SECRET","refreshTokenEnv":"YOUTUBE_WERKSTERN_REFRESH_TOKEN"}]
+          SOCIAL_PROVIDER_CREDENTIALS_JSON: ${{ secrets.SOCIAL_PROVIDER_CREDENTIALS_JSON }}
         run: node publish-cloud.mjs --check
-
-  keepalive:
-    if: github.event_name == 'schedule' && github.event.schedule == '7 3 * * *'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    concurrency:
-      group: keepalive
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-      - name: Daily keepalive commit + Loop-Bootstrap
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git config user.name "scheduler-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "keepalive [skip ci]"
-          git push
-          gh workflow run scheduler.yml --ref main -f mode=loop || true
