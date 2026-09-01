@@ -37,7 +37,7 @@ async function publishMeta({ r2Credentials, item, target, state, checkpoint }) {
 }
 
 export async function dispatchTarget(context) {
-  await verifyMediaAssets(context.r2Credentials, context.item);
+  await verifyMediaAssets(context.r2Credentials, context.item, context.target, context.state);
   const platform = context.target.platform;
   if (platform === "instagram" || platform === "facebook") return publishMeta(context);
   if (platform === "youtube") return publishYouTube({ ...context, credentials: youtubeCredentials(context.item) });
@@ -45,15 +45,32 @@ export async function dispatchTarget(context) {
   throw new QaBlockedError("Unbekannter Publishing-Provider.", { platform, code: "PLATFORM_UNSUPPORTED" });
 }
 
-async function verifyMediaAssets(credentials, item) {
-  const assets = Array.isArray(item.media?.slides) ? item.media.slides : [item.media];
-  for (const asset of assets) {
+export async function verifyMediaAssets(credentials, item, target, state = {}) {
+  const assets = (Array.isArray(item.media?.slides) ? item.media.slides : [item.media]).map((asset) => ({
+    asset,
+    invalidCode: "R2_MEDIA_INVALID",
+    mismatchCode: "R2_MEDIA_MISMATCH",
+    label: "Medium"
+  }));
+  if (target?.platform === "youtube") {
+    const expectedHash = String(target.options?.thumbnail?.sha256 ?? "").toLowerCase();
+    const confirmed = (state.thumbnailPhase === "CONFIRMED" || state.thumbnailSet === true)
+      && String(state.thumbnailSha256 ?? "").toLowerCase() === expectedHash
+      && expectedHash !== "";
+    if (!confirmed) assets.push({
+      asset: item.youtubeThumbnail,
+      invalidCode: "YOUTUBE_THUMBNAIL_INVALID",
+      mismatchCode: "YOUTUBE_THUMBNAIL_MISMATCH",
+      label: "YouTube-Thumbnail"
+    });
+  }
+  for (const { asset, invalidCode, mismatchCode, label } of assets) {
     if (!asset?.objectKey || !asset.sha256 || !Number.isSafeInteger(Number(asset.bytes))) {
-      throw new QaBlockedError("Queue-Mediendaten sind unvollstaendig.", { code: "R2_MEDIA_INVALID" });
+      throw new QaBlockedError(`${label}daten in der Queue sind unvollstaendig.`, { code: invalidCode });
     }
     const remote = await headObject(credentials, asset.objectKey);
     if (!remote.exists || remote.sha256 !== asset.sha256 || remote.bytes !== Number(asset.bytes)) {
-      throw new QaBlockedError("R2-Medium stimmt nicht mit dem QA-gebundenen Asset ueberein.", { code: "R2_MEDIA_MISMATCH", objectKey: asset.objectKey });
+      throw new QaBlockedError(`R2-${label} stimmt nicht mit dem QA-gebundenen Asset ueberein.`, { code: mismatchCode, objectKey: asset.objectKey });
     }
   }
 }

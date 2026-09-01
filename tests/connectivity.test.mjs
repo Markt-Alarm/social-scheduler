@@ -100,7 +100,8 @@ test("cloud check verifies OAuth and channel binding without writes or secret ou
       assert.equal(body.get("refresh_token"), "refresh-sentinel");
       assert.deepEqual(new Set(body.get("scope")?.split(" ")), new Set([
         "https://www.googleapis.com/auth/youtube.upload",
-        "https://www.googleapis.com/auth/youtube.readonly"
+        "https://www.googleapis.com/auth/youtube.readonly",
+        "https://www.googleapis.com/auth/youtube.force-ssl"
       ]));
       return Response.json({ access_token: "access-sentinel" });
     }

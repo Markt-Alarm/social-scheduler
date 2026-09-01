@@ -6,6 +6,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { contentTypeFor, headObject, putObjectFile, r2Credentials, sha256File } from "./cloud-lib.mjs";
 import { accountRegistryFromConfig, mergeSeedItem, mutateQueueWithCas, normalizeTargets, SUPPORTED_PLATFORMS } from "./queue-store.mjs";
@@ -16,6 +17,8 @@ const DEFAULT_CONFIG = "D:\\Kreativ\\Social Media\\upload-config.json";
 const DEFAULT_VALIDATOR = "C:\\Users\\aaron\\.codex\\skills\\upload\\scripts\\validate-package.mjs";
 const SUPPORTED_KINDS = new Set(["post", "story", "reel", "video", "carousel"]);
 const MAX_SINGLE_PUT_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_YOUTUBE_THUMBNAIL_BYTES = 2 * 1024 * 1024;
+const YOUTUBE_THUMBNAIL_CONTENT_TYPES = new Set(["image/jpeg", "image/png"]);
 const CLOUD_CLAIMABLE_STATUSES = new Set(["SCHEDULED", "WAITING_APPROVAL", "PARTIAL", "NEEDS_CONFIGURATION", "CLOUD_SYNC_PENDING", "CLOUD_SCHEDULED"]);
 
 function arg(name) {
@@ -186,7 +189,49 @@ async function validateFresh({ validator, configPath, packageRoot, local, platfo
   return { report: payload.report, validatedPackage };
 }
 
-async function readPackageMedia(packageRoot, validatedPackage, credentials) {
+function isWithin(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+export async function stageValidatedAsset({ packageRoot, expected, credentials, role, maxBytes = MAX_SINGLE_PUT_BYTES, allowedContentTypes = null }) {
+  const file = path.resolve(String(expected?.path ?? ""));
+  if (!expected?.path || !isWithin(packageRoot, file)) throw new Error(`${role} liegt ausserhalb des QA-geprueften Paketordners.`);
+  const [realRoot, realFile] = await Promise.all([
+    fs.realpath(packageRoot).catch(() => null),
+    fs.realpath(file).catch(() => null)
+  ]);
+  if (!realRoot || !realFile || !isWithin(realRoot, realFile)) throw new Error(`${role} fehlt oder verlaesst ueber einen Link den Paketordner.`);
+  const stat = await fs.stat(realFile).catch(() => null);
+  if (!stat?.isFile()) throw new Error(`${role} fehlt: ${file}`);
+  if (stat.size < 1 || stat.size > maxBytes) throw new Error(`${role} ueberschreitet das erlaubte Groessenlimit von ${maxBytes} Bytes: ${file}`);
+  const extension = path.extname(realFile).toLowerCase();
+  const contentType = contentTypeFor(extension);
+  if (!contentType || (allowedContentTypes && !allowedContentTypes.has(contentType))) throw new Error(`Nicht unterstuetzte Erweiterung fuer ${role}: ${extension}`);
+  const expectedExtension = String(expected.extension ?? extension).toLowerCase();
+  const expectedContentType = String(expected.contentType ?? contentType).toLowerCase();
+  const sha256 = await sha256File(realFile);
+  if (String(expected.sha256 ?? "").toLowerCase() !== sha256 || Number(expected.bytes) !== stat.size || expectedExtension !== extension || expectedContentType !== contentType) {
+    throw new Error(`${role} aenderte sich nach der frischen Upload-Skill-QA: ${file}`);
+  }
+  const objectKey = `assets/${sha256.slice(0, 2)}/${sha256}${extension}`;
+  const existing = await headObject(credentials, objectKey);
+  if (existing.exists && (existing.sha256 !== sha256 || existing.bytes !== stat.size)) {
+    throw new Error(`Inhaltsadressiertes R2-Objekt ${objectKey} hat widerspruechliche Hash-/Groessenmetadaten.`);
+  }
+  if (!existing.exists) await putObjectFile(credentials, { file: realFile, objectKey, contentType, bytes: stat.size, sha256 });
+  return {
+    objectKey,
+    path: path.relative(path.resolve(packageRoot), file),
+    contentType,
+    extension,
+    bytes: stat.size,
+    sha256,
+    role
+  };
+}
+
+export async function readPackageMedia(packageRoot, validatedPackage, credentials) {
   const mediaFiles = [];
   if (validatedPackage.kind === "carousel") {
     const slides = Array.isArray(validatedPackage.slides) ? validatedPackage.slides : [];
@@ -197,32 +242,39 @@ async function readPackageMedia(packageRoot, validatedPackage, credentials) {
   }
   const media = [];
   for (const entry of mediaFiles) {
-    const stat = await fs.stat(entry.file).catch(() => null);
-    if (!stat?.isFile()) throw new Error(`Mediendatei fehlt: ${entry.file}`);
-    if (stat.size < 1 || stat.size > MAX_SINGLE_PUT_BYTES) throw new Error(`Medium ueberschreitet das 5-GiB-Limit des aktuell implementierten R2-Single-PUT: ${entry.file}`);
-    const extension = path.extname(entry.file).toLowerCase();
-    const contentType = contentTypeFor(extension);
-    if (!contentType) throw new Error(`Nicht unterstuetzte Medienerweiterung: ${extension}`);
-    const sha256 = await sha256File(entry.file);
-    if (entry.expected?.sha256 !== sha256 || Number(entry.expected?.bytes) !== stat.size || (entry.expected?.extension && entry.expected.extension !== extension)) {
-      throw new Error(`Medium aenderte sich nach der frischen Upload-Skill-QA: ${entry.file}`);
-    }
-    const objectKey = `assets/${sha256.slice(0, 2)}/${sha256}${extension}`;
-    const existing = await headObject(credentials, objectKey);
-    if (existing.exists && (existing.sha256 !== sha256 || existing.bytes !== stat.size)) {
-      throw new Error(`Inhaltsadressiertes R2-Objekt ${objectKey} hat widerspruechliche Hash-/Groessenmetadaten.`);
-    }
-    if (!existing.exists) {
-      await putObjectFile(credentials, { file: entry.file, objectKey, contentType, bytes: stat.size, sha256 });
-    }
-    media.push({ objectKey, path: path.relative(packageRoot, entry.file), contentType, bytes: stat.size, sha256, role: entry.label || "primary" });
+    media.push(await stageValidatedAsset({
+      packageRoot,
+      expected: entry.expected,
+      credentials,
+      role: entry.label || "primary"
+    }));
   }
   return media;
 }
 
-function buildCloudItem({ local, validatedPackage, media, uploadConfig, packageRoot, tiktokApproval }) {
+export async function readYouTubeThumbnail(packageRoot, validatedPackage, credentials) {
+  const platforms = (validatedPackage.platforms ?? []).map((value) => String(value).toLowerCase());
+  if (!platforms.includes("youtube")) return null;
+  if (!validatedPackage.youtubeThumbnail) throw new Error("YouTube-Paket besitzt kein QA-gebundenes Custom Thumbnail.");
+  return stageValidatedAsset({
+    packageRoot,
+    expected: validatedPackage.youtubeThumbnail,
+    credentials,
+    role: "youtube-thumbnail",
+    maxBytes: MAX_YOUTUBE_THUMBNAIL_BYTES,
+    allowedContentTypes: YOUTUBE_THUMBNAIL_CONTENT_TYPES
+  });
+}
+
+export function buildCloudItem({ local, validatedPackage, media, youtubeThumbnail, uploadConfig, packageRoot, tiktokApproval }) {
   const accountId = String(local.accountId ?? validatedPackage.brand ?? local.brand);
   if (accountId !== validatedPackage.brand || String(local.brand ?? accountId) !== accountId) throw new Error("Lokales Item und frische QA binden unterschiedliche Accounts.");
+  const identityVersion = Number(validatedPackage.identityVersion);
+  if (identityVersion !== Number(local.identityVersion ?? 1)) throw new Error("Lokales Item und frische QA verwenden unterschiedliche Identity-Versionen.");
+  if (String(validatedPackage.fingerprint ?? "").toLowerCase() !== String(local.fingerprint ?? "").toLowerCase()) throw new Error("Frische QA und lokales Item binden unterschiedliche Fingerprints.");
+  if (identityVersion === 2 && (!validatedPackage.contentId || String(validatedPackage.contentId) !== String(local.contentId ?? ""))) {
+    throw new Error("Frische Identity-v2-QA und lokales Item binden unterschiedliche contentIds.");
+  }
   const platforms = [...new Set((validatedPackage.platforms ?? []).map((value) => String(value).toLowerCase()))];
   if (!platforms.length || platforms.some((platform) => !SUPPORTED_PLATFORMS.includes(platform))) throw new Error("Item enthaelt eine nicht unterstuetzte Plattform.");
   const localTargets = Array.isArray(local.targets) ? local.targets : [];
@@ -235,6 +287,22 @@ function buildCloudItem({ local, validatedPackage, media, uploadConfig, packageR
     throw new Error("Lokale Zielplattformen stimmen nicht mit der frischen QA ueberein.");
   }
   const options = structuredClone(validatedPackage.options ?? {});
+  if (platforms.includes("youtube")) {
+    if (identityVersion !== 2) throw new Error("YouTube Custom Thumbnails erfordern eine Identity-v2-Paketbindung.");
+    const snapshotChannelId = String(validatedPackage.targetSnapshot?.youtube?.channelId ?? "");
+    const configuredChannelId = String(uploadConfig.accounts?.[accountId]?.youtube?.channelId ?? "");
+    if (!snapshotChannelId || snapshotChannelId !== configuredChannelId) throw new Error("Der Identity-v2-Snapshot bindet nicht den konfigurierten YouTube-Kanal.");
+    const expectedThumbnail = options.youtube?.thumbnail;
+    if (!youtubeThumbnail || !expectedThumbnail
+      || youtubeThumbnail.sha256 !== expectedThumbnail.sha256
+      || youtubeThumbnail.bytes !== Number(expectedThumbnail.bytes)
+      || youtubeThumbnail.extension !== String(expectedThumbnail.extension ?? "").toLowerCase()
+      || youtubeThumbnail.contentType !== String(expectedThumbnail.contentType ?? "").toLowerCase()) {
+      throw new Error("Gestagetes YouTube-Thumbnail stimmt nicht mit der Identity-v2-Optionenbindung ueberein.");
+    }
+  } else if (youtubeThumbnail) {
+    throw new Error("Ein YouTube-Thumbnail darf nicht an ein Paket ohne YouTube-Ziel gebunden werden.");
+  }
   const rawTargets = platforms.map((platform) => {
     const localTarget = localTargets.find((target) => String(target?.platform).toLowerCase() === platform);
     const canonicalId = `${platform}:${accountId}`;
@@ -254,9 +322,10 @@ function buildCloudItem({ local, validatedPackage, media, uploadConfig, packageR
   }));
   return {
     schemaVersion: 2,
-    identityVersion: Number(local.identityVersion ?? 1),
-    fingerprint: String(local.fingerprint).toLowerCase(),
-    contentId: local.contentId ?? null,
+    identityVersion,
+    fingerprint: String(validatedPackage.fingerprint).toLowerCase(),
+    contentId: identityVersion === 2 ? validatedPackage.contentId : (local.contentId ?? null),
+    ...(validatedPackage.targetSnapshot ? { targetSnapshot: structuredClone(validatedPackage.targetSnapshot) } : {}),
     brand: accountId,
     accountId,
     kind: validatedPackage.kind,
@@ -270,6 +339,7 @@ function buildCloudItem({ local, validatedPackage, media, uploadConfig, packageR
     timeZone: local.timeZone ?? uploadConfig.timeZone ?? "Europe/Berlin",
     caption: validatedPackage.caption,
     media: validatedPackage.kind === "carousel" ? { slides: media } : media[0],
+    ...(youtubeThumbnail ? { youtubeThumbnail } : {}),
     account: accountSnapshot(uploadConfig, accountId),
     options,
     source: packageRoot,
@@ -368,6 +438,9 @@ async function main() {
       const packageRoot = String(local.packageRoot ?? "").trim();
       if (!packageRoot) throw new Error("packageRoot fehlt im lokalen Item.");
       const platforms = Array.isArray(local.targets) && local.targets.length ? local.targets.map((target) => target.platform) : (local.platforms ?? uploadConfig.publishing?.defaultPlatforms);
+      if (platforms.map((value) => String(value).toLowerCase()).includes("youtube") && Number(local.identityVersion) !== 2) {
+        throw new Error("YouTube Cloud-Publishing mit Custom Thumbnail erfordert ein neu freigegebenes Identity-v2-Item.");
+      }
       const fresh = await validateFresh({ validator, configPath, packageRoot, local, platforms });
       const validatedPackage = fresh.validatedPackage;
       if (validatedPackage.kind !== local.kind) throw new Error(`Kind-Widerspruch (QA ${validatedPackage.kind} vs. Item ${local.kind}).`);
@@ -375,10 +448,11 @@ async function main() {
         throw new Error("Frischer QA-Paket-Snapshot passt nicht zum lokalen Scheduler-Item.");
       }
       const media = await readPackageMedia(packageRoot, validatedPackage, credentials);
+      const youtubeThumbnail = await readYouTubeThumbnail(packageRoot, validatedPackage, credentials);
       const tiktokTarget = (local.targets ?? []).find((target) => String(target?.platform).toLowerCase() === "tiktok");
       const configuredTikTokMode = String(tiktokTarget?.options?.mode ?? uploadConfig.accounts?.[local.accountId ?? local.brand]?.tiktok?.mode ?? "inbox").toLowerCase();
       const tiktokApproval = ["direct", "direct-post"].includes(configuredTikTokMode) ? await readTikTokApproval(stateDir, fingerprint) : null;
-      cloudItems.push(buildCloudItem({ local, validatedPackage, media, uploadConfig, packageRoot, tiktokApproval }));
+      cloudItems.push(buildCloudItem({ local, validatedPackage, media, youtubeThumbnail, uploadConfig, packageRoot, tiktokApproval }));
     } catch (error) {
       problems.push({ fingerprint: fingerprint.slice(0, 8), account: local.accountId ?? local.brand, kind: local.kind, package: path.basename(String(local.packageRoot ?? "?")), grund: error.message });
       await updateLocalCloudState(itemFile, fingerprint, {
@@ -433,7 +507,9 @@ async function main() {
   if (problems.length) process.exitCode = 2;
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exit(1);
+  });
+}

@@ -67,6 +67,39 @@ test("seeding an added YouTube target preserves successful Meta states", () => {
   assert.equal(merged.status, "PARTIAL");
 });
 
+test("queue normalization and reseeding preserve the private bound YouTube thumbnail", () => {
+  const thumbnail = {
+    objectKey: `assets/bb/${"b".repeat(64)}.jpg`,
+    path: "thumbnail.jpg",
+    bytes: 2048,
+    sha256: "b".repeat(64),
+    extension: ".jpg",
+    contentType: "image/jpeg",
+    role: "youtube-thumbnail"
+  };
+  const incoming = {
+    schemaVersion: 2,
+    identityVersion: 2,
+    fingerprint: fp,
+    contentId: "content-1",
+    brand: "aeris",
+    accountId: "aeris",
+    kind: "video",
+    scheduledAt: "2026-09-01T08:00:00.000Z",
+    platforms: ["youtube"],
+    targets: [{ id: "youtube:aeris", platform: "youtube", accountId: "aeris", options: { thumbnail: { sha256: thumbnail.sha256, bytes: thumbnail.bytes, extension: thumbnail.extension, contentType: thumbnail.contentType } } }],
+    targetSnapshot: { youtube: { channelId: "UC_BOUND" } },
+    youtubeThumbnail: thumbnail
+  };
+  const normalized = normalizeItem(incoming);
+  assert.deepEqual(normalized.youtubeThumbnail, thumbnail);
+  assert.equal(normalized.targetSnapshot.youtube.channelId, "UC_BOUND");
+  const merged = mergeSeedItem({ ...normalized, targetStates: { "youtube:aeris": { status: "PROCESSING", thumbnailPhase: "CONFIRMED", thumbnailSet: true, thumbnailSha256: thumbnail.sha256 } } }, incoming);
+  assert.deepEqual(merged.youtubeThumbnail, thumbnail);
+  assert.equal(merged.targetStates["youtube:aeris"].thumbnailPhase, "CONFIRMED");
+  assert.equal(merged.targetStates["youtube:aeris"].thumbnailSha256, thumbnail.sha256);
+});
+
 test("dynamic registry supports five accounts without hardcoded branches", () => {
   const accounts = Object.fromEntries(["werkstern", "massage-zuhause", "aeris", "kanal-4", "werbung"].map((id, index) => [id, { displayName: id, color: `#${String(index + 1).repeat(6)}`, purpose: id === "werbung" ? "paid" : "organic" }]));
   const registry = accountRegistryFromConfig({ accounts });
@@ -99,10 +132,11 @@ test("redistribution preserves lead offsets and never moves a terminal target", 
 
 test("dashboard redaction removes provider capabilities recursively", () => {
   const queue = redactQueue({
-    items: [{ fingerprint: fp, brand: "aeris", kind: "video", scheduledAt: "2026-09-01T08:00:00.000Z", platforms: ["youtube"], targetStates: { "youtube:aeris": { status: "UPLOAD_SESSION", resumableSessionUri: "https://secret", nested: { refreshToken: "secret" } } } }]
+    items: [{ fingerprint: fp, brand: "aeris", kind: "video", scheduledAt: "2026-09-01T08:00:00.000Z", platforms: ["youtube"], youtubeThumbnail: { objectKey: "assets/thumb.jpg", thumbnailUrl: "https://signed-thumbnail-secret" }, targetStates: { "youtube:aeris": { status: "UPLOAD_SESSION", resumableSessionUri: "https://secret", nested: { refreshToken: "secret" } } } }]
   });
   const serialized = JSON.stringify(queue);
   assert.equal(serialized.includes("https://secret"), false);
+  assert.equal(serialized.includes("signed-thumbnail-secret"), false);
   assert.equal(serialized.includes("refreshToken"), false);
   assert.equal(queue.items[0].targetStates["youtube:aeris"].status, "UPLOAD_SESSION");
 });

@@ -6,7 +6,7 @@ export const QUEUE_KEY = "scheduler/queue.json";
 export const SUPPORTED_PLATFORMS = Object.freeze(["instagram", "facebook", "youtube", "tiktok"]);
 const PLATFORM_SET = new Set(SUPPORTED_PLATFORMS);
 const TERMINAL_TARGET_STATUSES = new Set(["PUBLISHED", "FAILED", "AMBIGUOUS", "ACTION_REQUIRED", "CANCELLED"]);
-const SECRET_KEY = /(access.?token|refresh.?token|claim.?token|client.?secret|authorization|credentials|resumable(session)?(uri)?|uploadurl|mediaurltemplate|oauth(code)?)/i;
+const SECRET_KEY = /(access.?token|refresh.?token|claim.?token|client.?secret|authorization|credentials|resumable(session)?(uri)?|uploadurl|mediaurltemplate|thumbnail.?url|oauth(code)?)/i;
 
 export class QueueConflictError extends Error {
   constructor(message) {
@@ -27,6 +27,20 @@ function plainObject(value) {
 function isoOrNull(value) {
   const milliseconds = Date.parse(String(value ?? ""));
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
+}
+
+function normalizeYouTubeThumbnail(value) {
+  const asset = plainObject(value);
+  if (!Object.keys(asset).length) return null;
+  return {
+    objectKey: String(asset.objectKey ?? "").trim(),
+    path: String(asset.path ?? ""),
+    contentType: String(asset.contentType ?? "").toLowerCase(),
+    extension: String(asset.extension ?? "").toLowerCase(),
+    bytes: Number(asset.bytes),
+    sha256: String(asset.sha256 ?? "").toLowerCase(),
+    role: "youtube-thumbnail"
+  };
 }
 
 export function targetId(platform, accountId) {
@@ -122,6 +136,11 @@ export function normalizeItem(raw) {
   item.identityVersion = Number(item.identityVersion ?? 1);
   item.accountId = String(item.accountId ?? item.brand ?? "").trim();
   item.brand = String(item.brand ?? item.accountId).trim();
+  if (item.youtubeThumbnail !== undefined) {
+    const thumbnail = normalizeYouTubeThumbnail(item.youtubeThumbnail);
+    if (thumbnail) item.youtubeThumbnail = thumbnail;
+    else delete item.youtubeThumbnail;
+  }
   item.targets = normalizeTargets(item);
   item.platforms = [...new Set(item.targets.map((target) => target.platform))];
   item.targetStates = normalizeTargetStates(item, item.targets);

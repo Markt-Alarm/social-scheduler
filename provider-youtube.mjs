@@ -1,5 +1,6 @@
 "use strict";
 
+import { createHash } from "node:crypto";
 import { AmbiguousMutationError, QaBlockedError, presignGet, sleep } from "./cloud-lib.mjs";
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -7,9 +8,12 @@ const API_ROOT = "https://www.googleapis.com/youtube/v3";
 const UPLOAD_ROOT = "https://www.googleapis.com/upload/youtube/v3";
 const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/youtube.upload",
-  "https://www.googleapis.com/auth/youtube.readonly"
+  "https://www.googleapis.com/auth/youtube.readonly",
+  "https://www.googleapis.com/auth/youtube.force-ssl"
 ];
 const CHUNK_BYTES = 8 * 1024 * 1024;
+const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
+const THUMBNAIL_CONTENT_TYPES = new Set(["image/jpeg", "image/png"]);
 
 async function responseJson(response) {
   return response.json().catch(() => ({}));
@@ -111,17 +115,18 @@ function youtubeMetadata(item, target) {
   }
   const actionAt = Date.parse(target.actionAt ?? item.scheduledAt);
   const scheduledAt = Date.parse(item.scheduledAt);
-  const earlyUpload = Number.isFinite(actionAt)
+  const scheduledPublication = Number.isFinite(actionAt)
     && Number.isFinite(scheduledAt)
     && actionAt + 60000 < scheduledAt
-    && scheduledAt > Date.now() + 60000
     && desiredPrivacy === "public";
-  const status = {
-    privacyStatus: earlyUpload ? "private" : desiredPrivacy,
+  const commonStatus = {
     selfDeclaredMadeForKids: options.madeForKids === true,
-    containsSyntheticMedia: options.containsSyntheticMedia === true
+    containsSyntheticMedia: options.containsSyntheticMedia === true,
+    license: String(options.license ?? "youtube"),
+    embeddable: options.embeddable !== false,
+    publicStatsViewable: options.publicStatsViewable !== false
   };
-  if (earlyUpload) status.publishAt = new Date(scheduledAt).toISOString();
+  if (!["youtube", "creativeCommon"].includes(commonStatus.license)) throw new QaBlockedError("Ungueltige YouTube-Lizenz.", { code: "YOUTUBE_LICENSE_INVALID" });
   const title = String(options.title ?? item.caption?.split(/\r?\n/)[0] ?? `${item.brand} ${item.kind}`);
   if (!title.trim()) throw new QaBlockedError("YouTube-Titel fehlt.", { code: "YOUTUBE_TITLE_MISSING" });
   return {
@@ -133,9 +138,399 @@ function youtubeMetadata(item, target) {
       categoryId: String(options.categoryId ?? "22"),
       defaultLanguage: options.defaultLanguage || undefined
     },
-    status,
+    status: { privacyStatus: "private", ...commonStatus },
+    commonStatus,
+    scheduledPublishAt: scheduledPublication ? new Date(scheduledAt).toISOString() : null,
     notifySubscribers: options.notifySubscribers !== false
   };
+}
+
+function thumbnailExpectation(item, target, expectedChannelId) {
+  if (Number(item.identityVersion) !== 2) {
+    throw new QaBlockedError("YouTube Custom Thumbnail ist nicht per Identity-v2 gebunden.", { code: "YOUTUBE_THUMBNAIL_INVALID" });
+  }
+  const snapshotChannelId = String(item.targetSnapshot?.youtube?.channelId ?? "");
+  if (!snapshotChannelId || snapshotChannelId !== expectedChannelId) {
+    throw new QaBlockedError("Der Identity-v2-Snapshot bindet nicht den geplanten YouTube-Kanal.", {
+      code: "YOUTUBE_THUMBNAIL_INVALID",
+      expectedChannelId,
+      snapshotChannelId: snapshotChannelId || null
+    });
+  }
+  const expected = target.options?.thumbnail;
+  const asset = item.youtubeThumbnail;
+  const sha256 = String(expected?.sha256 ?? "").toLowerCase();
+  const bytes = Number(expected?.bytes);
+  const extension = String(expected?.extension ?? "").toLowerCase();
+  const contentType = String(expected?.contentType ?? "").toLowerCase();
+  if (!asset?.objectKey || !/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_THUMBNAIL_BYTES
+    || ![".jpg", ".jpeg", ".png"].includes(extension) || !THUMBNAIL_CONTENT_TYPES.has(contentType)
+    || String(asset.sha256 ?? "").toLowerCase() !== sha256 || Number(asset.bytes) !== bytes
+    || String(asset.extension ?? "").toLowerCase() !== extension || String(asset.contentType ?? "").toLowerCase() !== contentType) {
+    throw new QaBlockedError("YouTube-Thumbnail ist nicht vollstaendig an den validierten Queue-Snapshot gebunden.", { code: "YOUTUBE_THUMBNAIL_INVALID" });
+  }
+  return { asset, sha256, bytes, extension, contentType };
+}
+
+function isThumbnailConfirmed(state, expected) {
+  if (state.thumbnailPhase !== "CONFIRMED" && state.thumbnailSet !== true) return false;
+  if (String(state.thumbnailSha256 ?? "").toLowerCase() !== expected.sha256) {
+    throw new AmbiguousMutationError("Bestaetigtes YouTube-Thumbnail hat einen anderen Hash; kein automatischer Replay.", {
+      expectedSha256: expected.sha256,
+      confirmedSha256: state.thumbnailSha256 ?? null
+    });
+  }
+  return true;
+}
+
+function retryDelay(response, fallbackMilliseconds) {
+  const value = response.headers.get("retry-after");
+  if (value && /^\d+$/.test(value)) return Math.max(1000, Number(value) * 1000);
+  const instant = Date.parse(String(value ?? ""));
+  return Number.isFinite(instant) ? Math.max(1000, instant - Date.now()) : fallbackMilliseconds;
+}
+
+async function downloadThumbnail(r2Credentials, expected) {
+  let response;
+  try {
+    response = await fetch(presignGet(r2Credentials, expected.asset.objectKey, 900), {
+      signal: AbortSignal.timeout(60000)
+    });
+  } catch {
+    const error = new QaBlockedError("R2-Thumbnail konnte voruebergehend nicht gelesen werden.", { code: "R2_THUMBNAIL_READ_RETRY" });
+    error.retryable = true;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new QaBlockedError("R2-Thumbnail konnte nicht gelesen werden.", { httpStatus: response.status, code: "R2_THUMBNAIL_READ_FAILED" });
+    error.retryable = response.status === 404 || response.status === 429 || response.status >= 500;
+    await response.body?.cancel().catch(() => {});
+    throw error;
+  }
+  const body = Buffer.from(await response.arrayBuffer());
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  if (body.byteLength !== expected.bytes || sha256 !== expected.sha256) {
+    throw new QaBlockedError("R2-Thumbnail stimmt nicht mit der QA-gebundenen Bytefolge ueberein.", {
+      code: "R2_THUMBNAIL_MISMATCH",
+      expectedBytes: expected.bytes,
+      actualBytes: body.byteLength,
+      expectedSha256: expected.sha256,
+      actualSha256: sha256
+    });
+  }
+  return body;
+}
+
+async function ensureThumbnail({ r2Credentials, accessToken, videoId, state, expected, save }) {
+  if (isThumbnailConfirmed(state, expected)) return;
+  if (state.thumbnailPhase === "REQUESTING") {
+    throw new AmbiguousMutationError("YouTube-Thumbnail besitzt eine unaufgeloeste fruehere Set-Anfrage; kein automatischer Replay.", {
+      videoId,
+      thumbnailSha256: expected.sha256
+    });
+  }
+  if (!videoId) throw new AmbiguousMutationError("YouTube-Thumbnail darf nicht ohne bestaetigte Video-ID gesetzt werden.");
+  const body = await downloadThumbnail(r2Credentials, expected);
+  const requestedAt = new Date().toISOString();
+  await save({
+    status: "SETTING_THUMBNAIL",
+    videoId,
+    remoteMediaId: videoId,
+    uploadComplete: true,
+    thumbnailPhase: "REQUESTING",
+    thumbnailSha256: expected.sha256,
+    thumbnailRequestedAt: requestedAt
+  });
+  const query = new URLSearchParams({ videoId, uploadType: "media" });
+  let response;
+  try {
+    response = await fetch(`${UPLOAD_ROOT}/thumbnails/set?${query}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": expected.contentType,
+        "content-length": String(body.byteLength)
+      },
+      body,
+      signal: AbortSignal.timeout(60000)
+    });
+  } catch (error) {
+    throw new AmbiguousMutationError("YouTube thumbnails.set brach nach dem REQUESTING-Checkpoint auf Netzwerkebene ab.", {
+      cause: error.message,
+      videoId,
+      thumbnailSha256: expected.sha256
+    });
+  }
+  if (response.ok) {
+    await response.body?.cancel().catch(() => {});
+    await save({
+      status: "UPLOADED",
+      videoId,
+      remoteMediaId: videoId,
+      uploadComplete: true,
+      thumbnailPhase: "CONFIRMED",
+      thumbnailSet: true,
+      thumbnailSha256: expected.sha256,
+      thumbnailSetAt: new Date().toISOString(),
+      thumbnailLastHttpStatus: response.status
+    });
+    return;
+  }
+  const status = response.status;
+  const details = await responseJson(response);
+  const reason = details.error?.errors?.[0]?.reason ?? null;
+  if (status >= 500) {
+    throw new AmbiguousMutationError("YouTube thumbnails.set lieferte nach dem REQUESTING-Checkpoint ein uneindeutiges Serverergebnis.", {
+      httpStatus: status,
+      reason,
+      videoId,
+      thumbnailSha256: expected.sha256
+    });
+  }
+  if (status === 404 || status === 429) {
+    const waitMilliseconds = retryDelay(response, status === 404 ? 5 * 60_000 : 60 * 60_000);
+    const actionAt = new Date(Date.now() + waitMilliseconds).toISOString();
+    await save({
+      status: "RETRY_SCHEDULED",
+      thumbnailPhase: "REJECTED_RETRYABLE",
+      thumbnailSha256: expected.sha256,
+      thumbnailLastHttpStatus: status,
+      actionAt
+    });
+    const error = new QaBlockedError("YouTube Custom Thumbnail wird nach einer eindeutigen voruebergehenden Ablehnung erneut versucht.", {
+      code: "YOUTUBE_THUMBNAIL_RETRY",
+      httpStatus: status,
+      reason,
+      actionAt
+    });
+    error.retryable = true;
+    error.retryAfterMs = waitMilliseconds;
+    throw error;
+  }
+  await save({
+    ...((status === 401 || status === 403) ? { status: "WAITING_CONFIGURATION" } : {}),
+    thumbnailPhase: "REJECTED",
+    thumbnailSha256: expected.sha256,
+    thumbnailLastHttpStatus: status
+  });
+  if (status === 401 || status === 403) {
+    const error = new QaBlockedError("YouTube Custom Thumbnail ist fuer diesen Kanal oder OAuth-Zugang nicht freigeschaltet.", {
+      code: "WAITING_CONFIGURATION",
+      httpStatus: status,
+      reason
+    });
+    error.configuration = true;
+    throw error;
+  }
+  throw new QaBlockedError("YouTube lehnte das Custom Thumbnail ab.", {
+    code: "YOUTUBE_THUMBNAIL_REJECTED",
+    httpStatus: status,
+    reason
+  });
+}
+
+function visibilityExpectation(metadata) {
+  const semantic = {
+    desiredPrivacy: metadata.desiredPrivacy,
+    scheduledPublishAt: metadata.scheduledPublishAt,
+    selfDeclaredMadeForKids: metadata.commonStatus.selfDeclaredMadeForKids,
+    containsSyntheticMedia: metadata.commonStatus.containsSyntheticMedia,
+    license: metadata.commonStatus.license,
+    embeddable: metadata.commonStatus.embeddable,
+    publicStatsViewable: metadata.commonStatus.publicStatsViewable
+  };
+  const sha256 = createHash("sha256").update(JSON.stringify(semantic)).digest("hex");
+  const scheduledAt = Date.parse(String(metadata.scheduledPublishAt ?? ""));
+  const scheduleInFuture = Number.isFinite(scheduledAt) && scheduledAt > Date.now();
+  const status = {
+    privacyStatus: scheduleInFuture ? "private" : metadata.desiredPrivacy,
+    ...metadata.commonStatus
+  };
+  if (scheduleInFuture) status.publishAt = metadata.scheduledPublishAt;
+  return {
+    sha256,
+    semantic,
+    status,
+    requiresMutation: status.privacyStatus !== "private" || Boolean(status.publishAt)
+  };
+}
+
+function visibilityRequestSha256(videoId, status) {
+  return createHash("sha256").update(JSON.stringify({ id: videoId, status })).digest("hex");
+}
+
+function matchesVisibilityResponse(data, videoId, expectedStatus) {
+  if (!data || String(data.id ?? "") !== videoId || !data.status || typeof data.status !== "object") return false;
+  for (const [key, expected] of Object.entries(expectedStatus)) {
+    const actual = data.status[key];
+    if (key === "privacyStatus") {
+      if (String(actual ?? "").toLowerCase() !== expected) return false;
+    } else if (actual !== expected) {
+      return false;
+    }
+  }
+  if (!("publishAt" in expectedStatus) && data.status.publishAt != null) return false;
+  return true;
+}
+
+function isVisibilityConfirmed(state, expected) {
+  if (state.visibilityPhase !== "CONFIRMED") return false;
+  if (String(state.visibilitySha256 ?? "").toLowerCase() !== expected.sha256) {
+    throw new AmbiguousMutationError("Bestaetigte YouTube-Sichtbarkeit passt nicht mehr zum gebundenen Ziel; kein automatischer Replay.", {
+      expectedSha256: expected.sha256,
+      confirmedSha256: state.visibilitySha256 ?? null
+    });
+  }
+  return true;
+}
+
+async function ensureVisibility({ accessToken, videoId, state, expected, actualStatus, save }) {
+  if (isVisibilityConfirmed(state, expected)) return { updated: false };
+  if (state.visibilityPhase === "REQUESTING") {
+    throw new AmbiguousMutationError("YouTube-Sichtbarkeit besitzt eine unaufgeloeste REQUESTING-Transition; kein automatischer Replay.", {
+      videoId,
+      visibilitySha256: expected.sha256
+    });
+  }
+  if (!expected.requiresMutation) {
+    const actualPrivacyStatus = String(actualStatus?.privacyStatus ?? "").toLowerCase();
+    if (actualPrivacyStatus !== "private") {
+      throw new QaBlockedError("YouTube-Video ist trotz gebundener privater Sichtbarkeit nicht privat.", {
+        code: "YOUTUBE_PRIVACY_MISMATCH",
+        desiredPrivacy: "private",
+        remotePrivacyStatus: actualPrivacyStatus || null
+      });
+    }
+    const requestSha256 = visibilityRequestSha256(videoId, expected.status);
+    await save({
+      status: "UPLOADED",
+      videoId,
+      remoteMediaId: videoId,
+      uploadComplete: true,
+      visibilityPhase: "CONFIRMED",
+      visibilitySha256: expected.sha256,
+      visibilityRequestSha256: requestSha256,
+      visibilityDesiredPrivacy: expected.semantic.desiredPrivacy,
+      visibilityPublishAt: expected.semantic.scheduledPublishAt,
+      visibilityAppliedPrivacyStatus: "private",
+      visibilityAppliedPublishAt: null,
+      visibilityConfirmedVia: "READ_BACK",
+      visibilityConfirmedAt: new Date().toISOString()
+    });
+    return { updated: false, remotePrivacyStatus: "private" };
+  }
+  const requestSha256 = visibilityRequestSha256(videoId, expected.status);
+  await save({
+    status: "UPDATING_VISIBILITY",
+    videoId,
+    remoteMediaId: videoId,
+    uploadComplete: true,
+    visibilityPhase: "REQUESTING",
+    visibilitySha256: expected.sha256,
+    visibilityRequestSha256: requestSha256,
+    visibilityDesiredPrivacy: expected.semantic.desiredPrivacy,
+    visibilityPublishAt: expected.semantic.scheduledPublishAt,
+    visibilityRequestedPrivacyStatus: expected.status.privacyStatus,
+    visibilityRequestedPublishAt: expected.status.publishAt ?? null,
+    visibilityRequestedAt: new Date().toISOString()
+  });
+  const query = new URLSearchParams({ part: "status" });
+  let response;
+  try {
+    response = await fetch(`${API_ROOT}/videos?${query}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json; charset=UTF-8"
+      },
+      body: JSON.stringify({ id: videoId, status: expected.status }),
+      signal: AbortSignal.timeout(30000)
+    });
+  } catch (error) {
+    throw new AmbiguousMutationError("YouTube-Sichtbarkeitsupdate brach nach dem REQUESTING-Checkpoint auf Netzwerkebene ab.", {
+      cause: error.message,
+      videoId,
+      visibilitySha256: expected.sha256
+    });
+  }
+  if (response.ok) {
+    const data = await responseJson(response);
+    if (!matchesVisibilityResponse(data, videoId, expected.status)) {
+      throw new AmbiguousMutationError("YouTube bestaetigte das Sichtbarkeitsupdate nicht mit der exakt angeforderten Video-Resource.", {
+        httpStatus: response.status,
+        videoId,
+        visibilitySha256: expected.sha256,
+        visibilityRequestSha256: requestSha256
+      });
+    }
+    await save({
+      status: "UPLOADED",
+      videoId,
+      remoteMediaId: videoId,
+      uploadComplete: true,
+      visibilityPhase: "CONFIRMED",
+      visibilitySha256: expected.sha256,
+      visibilityRequestSha256: requestSha256,
+      visibilityDesiredPrivacy: expected.semantic.desiredPrivacy,
+      visibilityPublishAt: expected.semantic.scheduledPublishAt,
+      visibilityAppliedPrivacyStatus: expected.status.privacyStatus,
+      visibilityAppliedPublishAt: expected.status.publishAt ?? null,
+      visibilityConfirmedAt: new Date().toISOString(),
+      visibilityLastHttpStatus: response.status
+    });
+    return { updated: true, remotePrivacyStatus: expected.status.privacyStatus };
+  }
+  const status = response.status;
+  const details = await responseJson(response);
+  const reason = details.error?.errors?.[0]?.reason ?? null;
+  if (status >= 500) {
+    throw new AmbiguousMutationError("YouTube-Sichtbarkeitsupdate lieferte nach dem REQUESTING-Checkpoint ein uneindeutiges Ergebnis.", {
+      httpStatus: status,
+      reason,
+      videoId,
+      visibilitySha256: expected.sha256
+    });
+  }
+  if (status === 404 || status === 429) {
+    const waitMilliseconds = retryDelay(response, status === 404 ? 5 * 60_000 : 60 * 60_000);
+    const actionAt = new Date(Date.now() + waitMilliseconds).toISOString();
+    await save({
+      status: "RETRY_SCHEDULED",
+      visibilityPhase: "REJECTED_RETRYABLE",
+      visibilitySha256: expected.sha256,
+      visibilityLastHttpStatus: status,
+      actionAt
+    });
+    const error = new QaBlockedError("YouTube-Video ist fuer das Sichtbarkeitsupdate noch nicht auffindbar.", {
+      code: "YOUTUBE_VISIBILITY_RETRY",
+      httpStatus: status,
+      reason,
+      actionAt
+    });
+    error.retryable = true;
+    error.retryAfterMs = waitMilliseconds;
+    throw error;
+  }
+  await save({
+    ...((status === 401 || status === 403) ? { status: "WAITING_CONFIGURATION" } : {}),
+    visibilityPhase: "REJECTED",
+    visibilitySha256: expected.sha256,
+    visibilityLastHttpStatus: status
+  });
+  if (status === 401 || status === 403) {
+    const error = new QaBlockedError("YouTube-Sichtbarkeit konnte mit diesem OAuth-Zugang nicht gesetzt werden.", {
+      code: "WAITING_CONFIGURATION",
+      httpStatus: status,
+      reason
+    });
+    error.configuration = true;
+    throw error;
+  }
+  throw new QaBlockedError("YouTube lehnte das Sichtbarkeitsupdate ab; das Video bleibt privat.", {
+    code: "YOUTUBE_VISIBILITY_REJECTED",
+    httpStatus: status,
+    reason
+  });
 }
 
 async function fetchVideoState(accessToken, videoId) {
@@ -166,10 +561,11 @@ async function fetchVideoState(accessToken, videoId) {
   return video;
 }
 
-async function reconcileVideo(accessToken, videoId, item, metadata, save) {
+async function reconcileVideo(accessToken, videoId, item, target, metadata, r2Credentials, state, expectedThumbnail, expectedVisibility, save) {
   const video = await fetchVideoState(accessToken, videoId);
   const uploadStatus = String(video.status?.uploadStatus ?? "").toLowerCase();
   const processingStatus = String(video.processingDetails?.processingStatus ?? "").toLowerCase();
+  const initialPrivacyStatus = String(video.status?.privacyStatus ?? "").toLowerCase();
   if (["failed", "rejected", "deleted"].includes(uploadStatus) || ["failed", "terminated"].includes(processingStatus)) {
     throw new QaBlockedError("YouTube-Verarbeitung ist fehlgeschlagen.", {
       code: "YOUTUBE_PROCESSING_FAILED",
@@ -179,6 +575,14 @@ async function reconcileVideo(accessToken, videoId, item, metadata, save) {
       rejectionReason: video.status?.rejectionReason ?? null
     });
   }
+  if (!isThumbnailConfirmed(state, expectedThumbnail) && initialPrivacyStatus && initialPrivacyStatus !== "private") {
+    throw new QaBlockedError("YouTube-Video wurde sichtbar, bevor das exakt gebundene Thumbnail bestaetigt war.", {
+      code: "YOUTUBE_PREMATURE_VISIBILITY",
+      remotePrivacyStatus: initialPrivacyStatus,
+      videoId
+    });
+  }
+  await ensureThumbnail({ r2Credentials, accessToken, videoId, state, expected: expectedThumbnail, save });
   const ready = uploadStatus === "processed" || processingStatus === "succeeded";
   if (!ready) {
     const nextPollAt = new Date(Date.now() + 5 * 60_000).toISOString();
@@ -186,6 +590,13 @@ async function reconcileVideo(accessToken, videoId, item, metadata, save) {
     const error = new QaBlockedError("YouTube verarbeitet das Video noch.", { code: "YOUTUBE_PROCESSING", uploadStatus, processingStatus });
     error.retryable = true;
     throw error;
+  }
+  const visibility = await ensureVisibility({ accessToken, videoId, state, expected: expectedVisibility, actualStatus: video.status, save });
+  if (visibility.updated) {
+    video.status ??= {};
+    video.status.privacyStatus = visibility.remotePrivacyStatus;
+    if (expectedVisibility.status.publishAt) video.status.publishAt = expectedVisibility.status.publishAt;
+    else delete video.status.publishAt;
   }
   const actualPrivacy = String(video.status?.privacyStatus ?? "").toLowerCase();
   const scheduledAtMs = Date.parse(item.scheduledAt);
@@ -284,15 +695,36 @@ export async function publishYouTube({ r2Credentials, item, target, state, crede
     await checkpoint(current);
   };
   if (current.status === "PUBLISHED") return current;
+  const expectedChannelId = String(item.account?.youtube?.channelId ?? target.channelId ?? "");
+  if (!expectedChannelId) {
+    const error = new QaBlockedError("YouTube channelId fehlt.", { code: "WAITING_CONFIGURATION" });
+    error.configuration = true;
+    throw error;
+  }
+  const expectedThumbnail = thumbnailExpectation(item, target, expectedChannelId);
+  const metadata = youtubeMetadata(item, target);
+  const expectedVisibility = visibilityExpectation(metadata);
+  if (current.thumbnailPhase === "REQUESTING") {
+    throw new AmbiguousMutationError("YouTube-Thumbnail besitzt eine unaufgeloeste REQUESTING-Transition; kein automatischer Replay.", {
+      videoId: current.videoId ?? current.remoteMediaId ?? null,
+      thumbnailSha256: current.thumbnailSha256 ?? null
+    });
+  }
+  isThumbnailConfirmed(current, expectedThumbnail);
+  if (current.visibilityPhase === "REQUESTING") {
+    throw new AmbiguousMutationError("YouTube-Sichtbarkeit besitzt eine unaufgeloeste REQUESTING-Transition; kein automatischer Replay.", {
+      videoId: current.videoId ?? current.remoteMediaId ?? null,
+      visibilitySha256: current.visibilitySha256 ?? null
+    });
+  }
+  isVisibilityConfirmed(current, expectedVisibility);
   if (current.status === "AMBIGUOUS" || (current.publishPhase === "REQUESTING" && !current.resumableSessionUri)) {
     throw new AmbiguousMutationError("YouTube-Sessionerzeugung ist uneindeutig; kein automatischer Replay.");
   }
-  const expectedChannelId = String(item.account?.youtube?.channelId ?? target.channelId ?? "");
   const accessToken = await authorizeYouTube(credentials, expectedChannelId);
-  const metadata = youtubeMetadata(item, target);
   const knownVideoId = String(current.videoId ?? current.remoteMediaId ?? "");
   if (knownVideoId && current.uploadComplete === true) {
-    await reconcileVideo(accessToken, knownVideoId, item, metadata, save);
+    await reconcileVideo(accessToken, knownVideoId, item, target, metadata, r2Credentials, current, expectedThumbnail, expectedVisibility, save);
     return current;
   }
   let sessionUri = current.resumableSessionUri ? validateSessionUri(current.resumableSessionUri) : "";
@@ -331,7 +763,7 @@ export async function publishYouTube({ r2Credentials, item, target, state, crede
       const videoId = String(snapshot.data?.id ?? current.remoteMediaId ?? "");
       if (!videoId) throw new AmbiguousMutationError("YouTube meldete Uploadabschluss ohne Video-ID.");
       await save({ status: "UPLOADED", videoId, remoteMediaId: videoId, uploadComplete: true, nextByte: Number(media.bytes) });
-      await reconcileVideo(accessToken, videoId, item, metadata, save);
+      await reconcileVideo(accessToken, videoId, item, target, metadata, r2Credentials, current, expectedThumbnail, expectedVisibility, save);
       return current;
     }
     offset = snapshot.offset;
@@ -359,7 +791,7 @@ export async function publishYouTube({ r2Credentials, item, target, state, crede
         const videoId = String(snapshot.data?.id ?? "");
         if (!videoId) throw new AmbiguousMutationError("YouTube-Upload endete uneindeutig ohne Video-ID.");
         await save({ status: "UPLOADED", videoId, remoteMediaId: videoId, uploadComplete: true, nextByte: Number(media.bytes) });
-        await reconcileVideo(accessToken, videoId, item, metadata, save);
+        await reconcileVideo(accessToken, videoId, item, target, metadata, r2Credentials, current, expectedThumbnail, expectedVisibility, save);
         return current;
       }
       offset = snapshot.offset;
@@ -385,7 +817,7 @@ export async function publishYouTube({ r2Credentials, item, target, state, crede
       }
       if (!videoId) throw new AmbiguousMutationError("YouTube bestaetigte den finalen Uploadblock ohne rekonstruierbare Video-ID.");
       await save({ status: "UPLOADED", videoId, remoteMediaId: videoId, uploadComplete: true, nextByte: Number(media.bytes) });
-      await reconcileVideo(accessToken, videoId, item, metadata, save);
+      await reconcileVideo(accessToken, videoId, item, target, metadata, r2Credentials, current, expectedThumbnail, expectedVisibility, save);
       return current;
     }
     if (response.status === 429 || response.status >= 500) {
@@ -393,7 +825,7 @@ export async function publishYouTube({ r2Credentials, item, target, state, crede
       if (snapshot.complete && snapshot.data?.id) {
         const videoId = String(snapshot.data.id);
         await save({ status: "UPLOADED", videoId, remoteMediaId: videoId, uploadComplete: true, nextByte: Number(media.bytes) });
-        await reconcileVideo(accessToken, videoId, item, metadata, save);
+        await reconcileVideo(accessToken, videoId, item, target, metadata, r2Credentials, current, expectedThumbnail, expectedVisibility, save);
         return current;
       }
       offset = snapshot.offset;
