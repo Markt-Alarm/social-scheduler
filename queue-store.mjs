@@ -242,12 +242,18 @@ export async function mutateQueueWithCas(credentials, mutation, options = {}) {
     const current = await readObject(credentials, queueKey);
     const parsed = current === null ? {} : JSON.parse(current.text);
     const queue = normalizeQueue(parsed);
+    // Revisions-Basis: gegen verlorene Updates bei schwachen ETags (R2 liefert
+    // durchgehend W/"..."-ETags; If-Match ist damit per HTTP-Spec unbrauchbar).
+    const readRevision = Number(parsed.revision ?? 0);
     const result = await mutation(queue);
     if (result?.changed === false) return { queue, result: result.value, attempts: attempt + 1, changed: false };
     queue.updatedAt = new Date().toISOString();
-    const conditional = current === null ? { ifNoneMatch: "*" } : { ifMatch: current.etag };
+    queue.revision = readRevision + 1;
+    // Starkes ETag vorhanden -> echtes If-Match-CAS. Schwaches ETag (W/...) ->
+    // revisionsbasiert + bedingungsloser PUT (Single-Writer: Workflow-Concurrency-Group).
+    const strongEtag = current !== null && current.etag && !current.etag.startsWith("W/");
     if (current !== null && !current.etag) throw new QueueConflictError("R2 lieferte keinen ETag; Queue-Update wird aus Sicherheitsgründen abgebrochen.");
-    const written = await writeObject(credentials, queueKey, JSON.stringify(queue, null, 1), conditional);
+    const written = await writeObject(credentials, queueKey, JSON.stringify(queue, null, 1), strongEtag ? { ifMatch: current.etag } : {});
     if (written.written) return { queue, result: result?.value, attempts: attempt + 1, changed: true };
     await wait(Math.min(80 * 2 ** attempt, 1200));
   }
