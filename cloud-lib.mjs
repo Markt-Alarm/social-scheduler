@@ -208,7 +208,7 @@ export async function putObjectFile(credentials, upload) {
       if (reconciled.exists && reconciled.sha256 === upload.sha256 && reconciled.bytes === upload.bytes) return;
       await delay(backoff(attempt));
     }
-    const body = fs.createReadStream(upload.file);
+    const body = upload.buffer ?? fs.createReadStream(upload.file);
     let response;
     try {
       response = await signedFetch(credentials, {
