@@ -1,4 +1,16 @@
-# Social Scheduler (PC-unabhängig)
+# Social Scheduler · Werkstern
+
+Eine technische Arbeitsprobe von **[Werkstern](https://werkstern.de)**:
+geplante Social-Media-Veröffentlichungen mit getrennten Zuständen je Zielkanal,
+nachvollziehbarer Freigabe und einer Queue in Cloudflare R2.
+
+**Einordnung:** Dies ist betriebliche Automationssoftware. Die Einrichtung
+erfordert eigene Provider-Zugänge, eine passende Kontokonfiguration und ergänzende
+lokale Freigabe- und QA-Skripte, die nicht vollständig in diesem Repository liegen.
+
+[Werkstern](https://werkstern.de) · [Projekt besprechen](https://werkstern.de/kontakt)
+
+## Funktionsumfang
 
 Veröffentlicht geplante Social-Media-Pakete nach Instagram, Facebook und YouTube sowie wahlweise in die TikTok-Inbox bzw. nach Audit per TikTok Direct Post. Die Ausführung läuft PC-unabhängig über GitHub Actions. Medien und Queue liegen in einem privaten Cloudflare-R2-Bucket, Tokens ausschließlich in GitHub Secrets.
 
@@ -85,7 +97,10 @@ Die übrigen validierten YouTube-Einstellungen werden beim Video-Insert ebenfall
 
 Der Seeder nutzt derzeit R2 Single-PUT und blockiert einzelne Dateien über 5 GiB. Größere YouTube-Dateien benötigen vor der Produktivfreigabe einen R2-Multipart-Uploader.
 
-## Neue Pakete veröffentlichen (nach der Sichtung)
+## Interner Betrieb: Pakete nach der Sichtung veröffentlichen
+
+Die folgenden Pfade sind Beispiele der bestehenden Betriebsumgebung.
+Sie müssen für eine andere Installation angepasst werden.
 
 ```bash
 node "D:\Bilder\MZM\approve-and-schedule.mjs" --package "<Paketordner>" --at "<ISO-Zeit>" --live
@@ -93,7 +108,9 @@ node "D:\Bilder\MZM\approve-and-schedule.mjs" --package "<Paketordner>" --at "<I
 
 `approve-and-schedule.mjs` ruft den fingerprint-scoped Seeder im Live-Modus automatisch auf. Zur Reparatur eines abgebrochenen Syncs kann derselbe Seeder-Befehl manuell wiederholt werden. Ein Bulk-Lauf ist absichtlich nur mit `--all` moeglich. CLI-Fortschritt wird als `CLOUD_SYNC_PENDING <fp8> ...` und nach vollstaendiger Bestaetigung als `CLOUD_SCHEDULED <fp8> ...` ausgegeben. Sobald auch nur ein angeforderter Fingerprint nicht vollstaendig bestaetigt ist, endet der Seeder ungleich null.
 
-Danach innerhalb von 5 Minuten in der Cloud geplant. Prüflauf: Workflow `publish-due` manuell mit `mode=check` dispatchen oder lokal `node publish-cloud.mjs --check`.
+Nach erfolgreicher Übertragung liegt das Paket in der Cloud-Queue. Die Ausführung
+hängt von einem aktiven Workflow und der GitHub-Auslieferung ab; der Fünf-Minuten-Takt
+ist keine garantierte Veröffentlichungsfrist. Prüflauf: Workflow `publish-due` manuell mit `mode=check` dispatchen oder lokal `node publish-cloud.mjs --check`.
 
 TikTok-Inbox nach der tatsächlichen Veröffentlichung in der App bestätigen:
 
